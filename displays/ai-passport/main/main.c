@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "agent_run/ar_ble.h"
+#include "agent_run/ar_capture.h"
 #include "agent_run/ar_link.h"
 #include "agent_run/ar_model.h"
 #include "agent_run/ar_settings.h"
@@ -145,6 +146,9 @@ static void app_task(void *arg) {
     ar_view_t view;
 
     for (;;) {
+        // 电脑请求截屏时先完成截屏(内部自行加 LVGL 锁),期间主循环暂停,画面不会变化
+        ar_capture_service();
+
         const int64_t now = esp_timer_get_time();
 
         ar_ble_status_t ble;
@@ -286,6 +290,7 @@ void app_main(void) {
 
     if (bsp_lvgl_lock(1000)) {
         ar_ui_create();
+        ar_capture_init();   // 在 BSP 圆角遮罩之后注册,截到的画面与屏幕一致
         bsp_lvgl_unlock();
     }
     s_last_key_us = esp_timer_get_time();

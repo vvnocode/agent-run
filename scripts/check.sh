@@ -31,7 +31,8 @@ cc_flags=(-std=c11 -Wall -Wextra -Werror -I"${fw}/main")
 "${CC:-cc}" "${cc_flags[@]}" "${fw}/tests/test_ar_raster.c" "${fw}/main/agent_run/ar_raster.c" \
     "${fw}/main/agent_run/ar_sprite.c" -o "${tmp}/raster"
 "${CC:-cc}" "${cc_flags[@]}" "${fw}/tests/test_ar_pair.c" "${fw}/main/agent_run/ar_pair.c" -o "${tmp}/pair"
-for t in proto model raster pair; do "${tmp}/${t}"; done
+"${CC:-cc}" "${cc_flags[@]}" "${fw}/tests/test_ar_capture.c" "${fw}/main/agent_run/ar_capture_math.c" -o "${tmp}/capture"
+for t in proto model raster pair capture; do "${tmp}/${t}"; done
 PYTHONDONTWRITEBYTECODE=1 python3 "${fw}/tests/test_ar_font_coverage.py"
 
 if ${build_firmware}; then

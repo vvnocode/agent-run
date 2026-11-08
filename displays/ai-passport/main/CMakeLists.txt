@@ -12,6 +12,8 @@ idf_component_register(
          "agent_run/ar_settings.c"
          "agent_run/ar_pair.c"
          "agent_run/ar_ble.c"
+         "agent_run/ar_capture_math.c"
+         "agent_run/ar_capture.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_driver_usb_serial_jtag esp_hw_support esp_timer nvs_flash
 )

@@ -8,7 +8,7 @@
 #include "esp_err.h"
 
 // 固件版本,随 HELLO 回报给主机
-#define AR_FW_VERSION "0.2.0"
+#define AR_FW_VERSION "0.3.0"
 
 // 状态帧来源
 typedef enum {

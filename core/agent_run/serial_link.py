@@ -53,6 +53,10 @@ class SerialLink:
         self._fd = fd
         self._buf = b""
 
+    def fileno(self):
+        """底层文件描述符，供截屏等需要直接读取二进制数据的场合使用。"""
+        return self._fd
+
     def close(self):
         """关闭端口；重复调用无副作用。"""
         if self._fd is not None:

@@ -70,7 +70,17 @@ AR1 S seq=<0-65535> cc=<0-99> cx=<0-99> ds=<0-99> done=<0-999> wn=<0-99> w=<列�
   - 桥接程序每 2 秒写一次 `~/.agent-run/run/ble-status.json`：`{"connected", "name", "fw", "updated", "hint"}`；
   - `connected` 只在设备回过 HELLO 后为 `true`。
 
-## 4. 本机状态文件
+## 4. 截屏（设备类展示端可选）
+
+与 AI Passport 社区的 `FAP_SCREENSHOT_V1` 协议一致，只在 USB 串口上使用：
+
+1. 主机发送一行 `FAP_SCREENSHOT_V1`；
+2. 设备回一行 `FAP_SCREENSHOT_V1 <宽> <高> RGB565LE <字节数>`；
+3. 设备紧接着发送恰好 `<字节数>` 字节的小端 RGB565 像素，按行从上到下排列。
+
+传输期间设备不输出日志，主机按声明的字节数精确读取。
+
+## 5. 本机状态文件
 
 `~/.agent-run/run/status.json` 在内容变化时和每 5 秒刷新一次。除第 1 节的快照字段外，还包含：
 
