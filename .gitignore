@@ -1,0 +1,20 @@
+# 迁移前的 FoloToy/ai-passport 克隆(迁移完成后删除)
+/firmware/
+
+# Python
+__pycache__/
+*.pyc
+
+# Swift
+.build/
+
+# ESP-IDF 构建产物与生成配置
+displays/ai-passport/build/
+displays/ai-passport/managed_components/
+displays/ai-passport/sdkconfig
+displays/ai-passport/sdkconfig.old
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
