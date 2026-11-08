@@ -1,97 +1,187 @@
 # Agent Run!
 
-把正在跑的 AI 编程 Agent 会话，变成看得见的状态：会话越多，宠物跑得越快；有会话在等你授权或回答，就停下来提醒你。
+Agent Run! 把本机正在运行的 AI 编程 Agent 会话（Claude Code、Codex、dsh）汇总成一块状态牌：工作中的会话越多，宠物跑得越快；有会话在等你授权或回答时，宠物停下来招手，并响一声提醒。
 
-目前支持在 [FoloToy AI Passport](https://ai-passport.folotoy.cn/) 上显示，经 USB 或蓝牙连接电脑。电脑浮窗、手机锁屏等展示方式计划中，都按同一份 [展示端协议](docs/protocol.md) 对接。
+当前的展示设备是 [FoloToy AI Passport](https://ai-passport.folotoy.cn/)，经 USB 或蓝牙连接电脑。展示端与采集端之间只靠一份公开的 [展示端协议](docs/protocol.md) 通信，电脑浮窗、手机锁屏等其他展示方式可以按同一协议接入。
 
-## 工作方式
+<p align="center">
+  <img src="docs/images/screen-sleep.png" width="160" alt="睡觉：没有工作中的会话">
+  <img src="docs/images/screen-walk.png" width="160" alt="慢走：1 个会话">
+  <img src="docs/images/screen-run.png" width="160" alt="狂奔：5 个会话">
+  <img src="docs/images/screen-dash.png" width="160" alt="冲刺：8 个会话">
+  <img src="docs/images/screen-waiting.png" width="160" alt="等你处理">
+</p>
+<p align="center"><sub>AI Passport 真机截图（经 <code>FAP_SCREENSHOT_V1</code> 串口截屏，放大 2 倍），画面中的数字为示例</sub></p>
 
-```
-Claude Code ─hook─┐
-Codex ───────hook─┼─> agent-run 采集程序 ──USB──────────────────────> AI Passport
-dsh ───hook 插件──┘        │            └──蓝牙（AgentRunBridge.app）──> AI Passport
-                           └──> ~/.agent-run/run/status.json（本机展示端）
-```
+## 功能
 
-- 采集程序通过各工具官方的 hook 接口拿到会话事件，汇总成“工作中”“等你处理”“今日完成”几个数字。
-- 送到展示端的只有计数和工具代号，没有项目名、路径或提示词。
+- **会话汇总：** 分别统计 Claude Code、Codex、dsh 正在执行任务的会话数，以及今日完成的轮数。
+- **跑速档位：** 按三者合计切换动画。
+
+  | 工作中的会话 | 0 | 1 | 2–3 | 4–6 | ≥7 |
+  |---|---|---|---|---|---|
+  | 画面 | 睡觉 | 慢走 | 小跑 | 狂奔 | 冲刺 |
+
+- **等你处理：** 遇到权限请求、提问或计划确认时，立刻切到提醒画面并响一次。这个画面优先于跑速，列表里写明是哪个工具、在等什么。
+- **两种连接：** 插着 USB 时走 USB；拔掉后自动改走蓝牙，插回自动切回。
+- **隐私：** 发给设备的只有计数、工具代号和原因代号，不含项目名、路径、提示词或会话内容。
 
 ## 支持情况
 
-| 工具 | 本机运行的会话 | 识别“等你处理” | 说明 |
+| 工具 | 支持的运行方式 | 识别“等你处理” | 接入条件 |
 |---|---|---|---|
-| Claude Code | 桌面端、CLI、VS Code 扩展 | 权限请求、提问（`AskUserQuestion`）、计划确认 | 已在桌面端实测 |
-| Codex | 桌面端、CLI | 权限请求、提问（含桌面端的异步提问） | 新装的 hook 要先在 Codex 里审查并信任 |
-| dsh | 需在所用 profile 中挂载官方插件 `@deepseek-ai/dsh-hooks-claude-code` | 提问（`ask_user_question`） | 未挂载插件时只按会话文件估算“工作中” |
+| Claude Code | 桌面端、CLI、VS Code 扩展 | 权限请求、`AskUserQuestion`、`ExitPlanMode` | 执行 `install-hooks` 后自动生效 |
+| Codex | 桌面端、CLI | 权限请求、`request_user_input`，以及桌面端的异步提问 `request_user_input_async` | 需在 Codex 中审查并信任新增的 hook |
+| dsh | 命令行启动的 profile（如 `dsh web`） | `ask_user_question` | 需在 profile 中挂载官方插件 `@deepseek-ai/dsh-hooks-claude-code`；未挂载时只按会话文件估算“工作中” |
 
-云端运行的会话（Claude Code on the web、Codex 云任务）不支持：它们不在本机，采集程序接收不到它们的事件。
+不支持在云端运行的会话（Claude Code on the web、Codex 云任务），因为采集程序只能接收本机的 hook 事件。DeepSeek Harness 桌面应用暂不支持识别提问，原因见 [已知限制](#已知限制)。
 
-## 目录结构
+## 工作原理
 
-| 目录 | 内容 |
-|---|---|
-| `core/` | 采集程序：hook 入口、会话状态机、守护进程、命令行 `agent-run`（Python 3.9 标准库） |
-| `transports/macos-ble/` | macOS 蓝牙桥接程序 `AgentRunBridge.app`（Swift） |
-| `displays/ai-passport/` | AI Passport 固件（ESP-IDF），见其 [README](displays/ai-passport/README.md) |
-| `docs/` | 展示端协议与设计方案 |
-| `scripts/check.sh` | 一次跑完全部测试 |
+```mermaid
+flowchart LR
+    CC[Claude Code] -- hook --> H[ar_hook.py]
+    CX[Codex] -- hook --> H
+    DS[dsh] -- hook 插件 --> H
+    H -- Unix 数据报 --> D[agent-run 守护进程]
+    D -- USB 串口 --> P[AI Passport]
+    D -- 本机 socket --> B[AgentRunBridge.app] -- 蓝牙 --> P
+    D -- status.json --> L[本机展示端]
+```
 
-## 安装（macOS）
+1. 各工具在会话开始、提交提示、调用工具、请求权限、结束一轮时调用 `ar_hook.py`。它只把会话 ID、事件名和工具名转给守护进程，并始终异步、静默地退出，不影响 Agent 运行。
+2. 守护进程维护每个会话的状态：工作中、等你处理或空闲。会话超时会自动回收，“今日完成”按本地日期计数。汇总结果按 [展示端协议](docs/protocol.md) 推送给设备，同时写入 `~/.agent-run/run/status.json`。
+3. 设备只负责显示、动画、按键和提示音，不联网，也不保存会话信息。
 
-需要：macOS 13 或更新版本，系统自带的 `/usr/bin/python3`；构建蓝牙桥接程序需要 Xcode；构建固件需要 ESP-IDF 5.5.3。
+事件到状态的完整映射见 [设计方案](docs/specs/2026-11-08-agent-run-design.md) §5。
 
-1. **安装采集程序并接入 hook：**
+## 快速开始
 
-   ```bash
-   core/bin/agent-run install-hooks      # 备份后，为 Claude Code 与 Codex 追加 hook
-   core/bin/agent-run install-service    # 复制到 ~/.agent-run，并注册登录自启
-   ```
+### 环境要求
 
-   Codex 需要在 CLI 的 `/hooks` 或桌面端 Settings → Hooks 里信任新 hook。`agent-run status` 会提示尚未信任的 hook。
+| 组件 | 要求 | 用途 |
+|---|---|---|
+| macOS | 13 或更新版本 | 采集程序与蓝牙桥接只支持 macOS |
+| Python | 系统自带的 `/usr/bin/python3`（3.9 及以上） | 采集程序，只依赖标准库 |
+| Xcode | 含 Swift 5.9 以上的工具链 | 构建蓝牙桥接程序（只用 USB 时不需要） |
+| ESP-IDF | 5.5.3 | 构建并烧录 AI Passport 固件 |
 
-2. **dsh（可选）：**
+### 1. 安装采集程序
 
-   ```bash
-   core/bin/agent-run install-dsh-hooks
-   ```
+```bash
+git clone https://github.com/vvnocode/agent-run.git
+cd agent-run
+core/bin/agent-run install-hooks     # 备份后，为 Claude Code 与 Codex 追加 hook
+core/bin/agent-run install-service   # 复制到 ~/.agent-run，注册为登录自启服务
+```
 
-   命令会生成 `~/.agent-run/dsh-hooks.json`，并打印需要加到 dsh profile 中的插件配置。插件版本要与 dsh 一致。DeepSeek Harness 桌面应用的 profile 只能在应用的插件管理里安装插件。
+`install-hooks` 只在 `~/.claude/settings.json` 和 `~/.codex/hooks.json` 中追加自己的条目，不改动已有 hook；修改前的文件备份在 `~/.agent-run/backup/`。
 
-3. **刷写 AI Passport：** 见 [displays/ai-passport/README.md](displays/ai-passport/README.md)。
+### 2. 在 Codex 中信任 hook
 
-4. **蓝牙（可选，不插线使用）：**
+Codex 只执行审查并信任过的 hook。在 Codex CLI 中执行 `/hooks`，或在桌面端打开 Settings → Hooks，信任 agent-run 新增的条目。之后执行 `agent-run status`，如果还有未信任的条目，会在末尾给出提示。
 
-   ```bash
-   transports/macos-ble/build.sh                   # 构建并安装到 ~/Applications
-   core/bin/agent-run install-bridge-service       # 注册登录自启
-   ```
+### 3. 接入 dsh（可选）
 
-   首次运行时 macOS 会请求蓝牙权限；设备上出现“配对这台电脑？”时按 OK。之后插着 USB 走 USB，拔掉自动改走蓝牙。
+```bash
+core/bin/agent-run install-dsh-hooks
+dsh plugin --profile web add @deepseek-ai/dsh-hooks-claude-code@<与 dsh 相同的版本>
+```
 
-## 常用命令
+第一条命令生成 `~/.agent-run/dsh-hooks.json`，并打印需要追加到 `~/.dsh/profiles/<profile>/cordis.patch.yml` 的挂载配置。重启该 profile 后生效。插件的 peer 依赖固定到具体的 dsh 版本，版本不一致时插件无法加载。
+
+### 4. 刷写 AI Passport
+
+构建与烧录步骤见 [displays/ai-passport/README.md](displays/ai-passport/README.md)。刷写完成后插上 USB，执行：
+
+```bash
+~/.agent-run/bin/agent-run status   # 应显示“设备链路：已连接 …（USB）”
+~/.agent-run/bin/agent-run demo     # 设备依次演示七种画面，约 42 秒
+```
+
+### 5. 启用蓝牙（可选）
+
+```bash
+transports/macos-ble/build.sh                    # 构建并安装到 ~/Applications/AgentRunBridge.app
+~/.agent-run/bin/agent-run install-bridge-service
+```
+
+1. 首次运行时，macOS 会请求蓝牙权限，点“允许”。
+2. 设备屏幕出现“配对这台电脑？”时，按 OK 确认。
+3. 之后拔掉 USB，设备会在约 15 秒内改走蓝牙，标题栏图标由 USB 插头变为蓝牙标志。
+
+## 命令参考
+
+安装后，命令位于 `~/.agent-run/bin/agent-run`。
 
 | 命令 | 作用 |
 |---|---|
-| `agent-run status [--events]` | 查看汇总状态、链路和最近收到的事件 |
-| `agent-run demo` | 让设备依次演示七种画面，约 42 秒 |
-| `agent-run setup` | 查找设备串口，写入配置 |
-| `agent-run uninstall-hooks` / `uninstall-service` | 卸载 hook 或登录自启（运行数据保留） |
+| `status [--events]` | 显示汇总状态、设备链路、需要处理的提示；`--events` 另列出最近 20 条事件 |
+| `demo` | 让设备依次演示睡觉、慢走、小跑、狂奔、冲刺、等你处理、未连接 |
+| `screenshot -o 文件.png [--scale N]` | 经 USB 截取设备屏幕。截屏前要先停止守护进程：`launchctl bootout gui/$(id -u)/local.agent-run` |
+| `setup` | 查找设备串口并写入 `~/.agent-run/config.json`；默认会自动查找，一般不需要 |
+| `install-hooks` / `uninstall-hooks` | 安装或删除 Claude Code、Codex 的 hook |
+| `install-service` / `uninstall-service` | 注册或注销采集程序的登录自启 |
+| `install-bridge-service` / `uninstall-bridge-service` | 注册或注销蓝牙桥接程序的登录自启 |
+| `install-dsh-hooks` | 生成 dsh 插件用的 hook 配置 |
+| `run` | 在前台运行守护进程，一般由 launchd 调用 |
+
+## 设备操作
+
+| 操作 | 作用 |
+|---|---|
+| 上 / 下 短按 | 调节亮度（5 档，断电保存） |
+| 确定 长按 | 切换静音（断电保存） |
+| 上 按住 5 秒 | 清除蓝牙配对，以便改连另一台电脑 |
+| 配对确认时 确定 / 下 | 接受 / 拒绝配对 |
+
+## 故障排查
+
+| 现象 | 处理 |
+|---|---|
+| Codex 跑任务时计数不变 | 执行 `agent-run status` 检查是否有未信任的 hook，按提示在 Codex 中信任 |
+| dsh 提问不提醒 | 确认所用 profile 已挂载 `dsh-hooks-claude-code` 插件，且版本与 dsh 一致；DeepSeek Harness 桌面应用暂不支持 |
+| 设备一直显示“未连接电脑” | 用 `agent-run status` 检查守护进程是否在运行；用 `--events` 查看事件是否到达 |
+| 烧录工具报端口被占用 | 守护进程会占用串口，烧录前执行 `launchctl bootout gui/$(id -u)/local.agent-run` |
+| 烧录后设备不响应 | 偶发现象，按电源键重启设备即可 |
+| 桥接日志出现 `Peer removed pairing information` | 设备上的配对已被清除（例如从 `0x0` 烧录过合并镜像）。在 系统设置 → 蓝牙 中忽略 `AgentRun-XXXX`，再在设备上确认重新配对 |
+
+日志位置：`~/.agent-run/log/agent-run.log`（采集程序）、`~/.agent-run/log/bridge.log`（蓝牙桥接）。
 
 ## 已知限制
 
-- Codex 桌面端的异步提问在你回答前一直算“等你处理”。如果你在 Agent 还在干活时就回答了，Codex 没有对应事件，提醒会一直持续到你下一次发消息。
-- 从 `0x0` 重新烧录合并镜像会清空设备上的蓝牙配对，需要在 Mac 的蓝牙设置里忽略设备后重新配对。
-- 电池续航、蓝牙下的长时间运行还没有实测数据。
+- **Codex 异步提问：** 桌面端的异步提问在你回答前一直算“等你处理”。如果你在 Agent 仍在工作时回答，Codex 不发出对应事件，提醒会持续到你下一次发送消息。
+- **DeepSeek Harness 桌面应用：** 它的插件管理只接受 npm 上声明了 `dsh.bundle.patch` 的打包插件，`dsh-hooks-claude-code` 不是这类插件，所以桌面应用中的会话只能估算“工作中”。
+- **重新烧录：** 从 `0x0` 烧录合并镜像会清空设备 NVS，包括亮度、静音设置和蓝牙配对。日常更新请用 `idf.py flash`。
+- **尚未实测：** 电池续航、蓝牙下的长时间运行，以及 Mac 睡眠唤醒后的重连。
+
+## 项目结构
+
+| 目录 | 内容 |
+|---|---|
+| `core/` | 采集程序：hook 入口、会话状态机、守护进程、命令行（Python 3.9 标准库） |
+| `transports/macos-ble/` | macOS 蓝牙桥接程序 `AgentRunBridge.app`（Swift，CoreBluetooth） |
+| `displays/ai-passport/` | AI Passport 固件（ESP-IDF 5.5.3） |
+| `docs/protocol.md` | 展示端协议：状态快照、AR1 行协议、USB 与蓝牙传输 |
+| `docs/specs/` | 设计方案：USB 版、蓝牙版、单仓库结构 |
+| `docs/images/` | README 使用的真机截图，由 `scripts/readme_screens.py` 生成 |
+| `scripts/` | `check.sh`（全部测试）、`readme_screens.py`（生成截图） |
 
 ## 开发
 
 ```bash
 scripts/check.sh              # Python、Swift 与固件宿主测试
-scripts/check.sh --firmware   # 另外构建固件（需先激活 ESP-IDF）
+scripts/check.sh --firmware   # 另外构建固件（需先执行 . ~/esp/esp-idf-v5.5.3/export.sh）
 ```
 
-设计方案见 `docs/specs/`。
+- 采集程序修改后，执行 `core/bin/agent-run install-service`，把新代码部署到 `~/.agent-run` 并重启服务。
+- 新增一种展示方式时，在 `displays/` 下新建目录，按 [展示端协议](docs/protocol.md) 实现。
+
+## 致谢
+
+- [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport)：AI Passport 的板级支持包与开发资料（MIT）。
+- [Noto Sans SC](https://github.com/notofonts/noto-cjk)：固件中文字体子集的来源（SIL Open Font License 1.1）。
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。`displays/ai-passport/` 中来自 FoloToy/ai-passport 的部分遵循其 MIT 许可；中文字体子集来自 Noto Sans SC（SIL OFL 1.1）。
+本项目以 MIT 许可发布，见 [LICENSE](LICENSE)。`displays/ai-passport/` 中来自 FoloToy/ai-passport 的部分保留其 MIT 许可声明。

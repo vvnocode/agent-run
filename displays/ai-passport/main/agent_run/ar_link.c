@@ -7,6 +7,8 @@
 #include "ar_link.h"
 
 #include <stdio.h>
+
+#include "ar_capture.h"
 #include <string.h>
 
 #include "driver/usb_serial_jtag.h"
@@ -51,8 +53,12 @@ void ar_link_publish(const ar_state_t *st, ar_source_t src) {
     xSemaphoreGive(s_lock);
 }
 
-// 处理一整行:状态帧写入快照,PING 回复 HELLO,其他行忽略
+// 处理一整行:状态帧写入快照,PING 回复 HELLO,截屏命令交给主循环,其他行忽略
 static void handle_line(const char *line) {
+    if (strcmp(line, "FAP_SCREENSHOT_V1") == 0) {
+        ar_capture_request();   // 截屏要持有 LVGL 锁并整屏刷新,放到主循环里做
+        return;
+    }
     ar_state_t st;
     switch (ar_proto_parse_line(line, &st)) {
     case AR_LINE_STATE:

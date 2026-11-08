@@ -50,10 +50,18 @@ EOF
 echo "字体:${font}(SHA-256 ${actual_sha256})"
 echo "非 ASCII 字符:${symbols}"
 
-npx --yes "lv_font_conv@${lv_font_conv_version}" \
-    --no-compress --no-prefilter --bpp 4 --size 14 \
-    --font "${font}" --range 0x20-0x7E --symbols "${symbols}" \
-    --format lvgl --lv-include "lvgl.h" --lv-font-name ar_font_cjk14 \
-    -o "${output}"
+# lv_font_conv 会把完整命令写进生成文件的头部注释:在字体所在目录里用相对文件名调用,
+# 输出到临时文件名再移入仓库,避免把本机路径写进提交的源码
+font_dir="$(cd "$(dirname "${font}")" && pwd)"
+font_name="$(basename "${font}")"
+(
+    cd "${font_dir}"
+    npx --yes "lv_font_conv@${lv_font_conv_version}" \
+        --no-compress --no-prefilter --bpp 4 --size 14 \
+        --font "${font_name}" --range 0x20-0x7E --symbols "${symbols}" \
+        --format lvgl --lv-include "lvgl.h" --lv-font-name ar_font_cjk14 \
+        -o ar_font_cjk14.c
+)
+mv "${font_dir}/ar_font_cjk14.c" "${output}"
 
 echo "已生成 ${output}"

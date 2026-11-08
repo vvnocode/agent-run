@@ -9,6 +9,9 @@
   uninstall-hooks   删除本工具安装的 hook
   install-service   部署脚本并注册 launchd，登录后自动运行
   uninstall-service 注销 launchd（保留运行数据）
+  install-dsh-hooks 生成 dsh hook 插件用的配置，并打印挂载方法
+  install-bridge-service / uninstall-bridge-service  注册或注销蓝牙桥接程序
+  screenshot        经 USB 截取设备屏幕（需先停止守护进程）
 """
 import argparse
 import json
@@ -179,6 +182,34 @@ def cmd_setup(args):
     return 1
 
 
+def cmd_screenshot(args):
+    """经 USB 截取设备屏幕，保存为 PNG。守护进程运行时占用串口，需先停止。"""
+    from . import screenshot
+
+    port = _port_finder(args.home)()
+    if not port:
+        print("没有找到 AI Passport 的 USB 串口。")
+        return 1
+    link = SerialLink(port)
+    try:
+        link.open()
+    except OSError as exc:
+        print("打开 %s 失败（%s）。截屏前请先停止采集程序：launchctl bootout gui/$(id -u)/local.agent-run" % (port, exc))
+        return 1
+    try:
+        width, height, rgb = screenshot.capture(link)
+    except screenshot.ScreenshotError as exc:
+        print("截屏失败：%s" % exc)
+        return 1
+    finally:
+        link.close()
+    rgb, width, height = screenshot.scale_rgb(rgb, width, height, args.scale)
+    with open(args.output, "wb") as f:
+        f.write(screenshot.encode_png(rgb, width, height))
+    print("已保存 %s（%d×%d）" % (args.output, width, height))
+    return 0
+
+
 def _agent_config_paths():
     return os.path.expanduser("~/.claude/settings.json"), os.path.expanduser("~/.codex/hooks.json")
 
@@ -218,6 +249,12 @@ def cmd_install_bridge_service(args):
     return 0
 
 
+def cmd_uninstall_bridge_service(args):
+    install.uninstall_service(install.BRIDGE_LABEL)
+    print("已注销蓝牙桥接程序的登录自启；如需彻底移除，再删除 ~/Applications/AgentRunBridge.app。")
+    return 0
+
+
 def cmd_uninstall_service(args):
     install.uninstall_service()
     print("已注销 launchd，运行数据保留在 %s。" % args.home)
@@ -231,6 +268,10 @@ def main(argv=None):
     status = sub.add_parser("status")
     status.add_argument("--events", action="store_true", help="同时列出最近收到的事件")
     status.set_defaults(func=cmd_status)
+    shot = sub.add_parser("screenshot", help="经 USB 截取设备屏幕（需先停止采集程序）")
+    shot.add_argument("-o", "--output", default="agent-run-screen.png", help="输出 PNG 路径")
+    shot.add_argument("--scale", type=int, default=1, help="最近邻放大倍数")
+    shot.set_defaults(func=cmd_screenshot)
     for name, func in [
         ("run", cmd_run),
         ("demo", cmd_demo),
@@ -240,6 +281,7 @@ def main(argv=None):
         ("uninstall-hooks", cmd_uninstall_hooks),
         ("install-service", cmd_install_service),
         ("install-bridge-service", cmd_install_bridge_service),
+        ("uninstall-bridge-service", cmd_uninstall_bridge_service),
         ("uninstall-service", cmd_uninstall_service),
     ]:
         sub.add_parser(name).set_defaults(func=func)

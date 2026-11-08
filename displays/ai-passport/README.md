@@ -55,6 +55,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.agent-run.plist
 | 配对确认时 确定 / 下 | 接受 / 拒绝 |
 | 任意键 | 背光关闭时只唤醒屏幕 |
 
+## 截屏
+
+固件实现了 AI Passport 社区使用的 `FAP_SCREENSHOT_V1` 串口截屏协议（见 [展示端协议](../../docs/protocol.md) §4）。用法：先停止采集程序，再执行 `agent-run screenshot -o screen.png --scale 2`。
+
+整屏缓冲需要 150 KB，设备拿不出这么大的内存。所以截屏时临时申请一块 64 行的条带缓冲（30 KB），分 5 段整屏刷新并逐段发送，一帧约 1 秒。仓库 README 里的截图由 `scripts/readme_screens.py` 用这个协议生成。
+
 ## 中文字体
 
 界面上的中文文案全部集中在 `main/agent_run/ar_text.h`。修改文案后重新生成字体：
