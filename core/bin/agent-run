@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""agent-run 命令入口。
+
+部署后位于 ~/.agent-run/bin/，包在 ../lib/agent_run；
+在仓库中直接运行时位于 host/bin/，包在 ../agent_run。
+"""
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _candidate in (os.path.join(_here, "..", "lib"), os.path.join(_here, "..")):
+    if os.path.isdir(os.path.join(_candidate, "agent_run")):
+        sys.path.insert(0, os.path.abspath(_candidate))
+        break
+
+from agent_run.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
