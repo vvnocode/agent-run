@@ -32,6 +32,10 @@ SCREENS = [
     ("waiting", Snapshot(cc=2, cx=1, ds=0, done=21, wn=2, waiting=[("claude", "A"), ("codex", "Q")])),
 ]
 
+# 等“完成 +N”提示结束的时间：固件 AR_DONE_FLASH_MS 为 5 秒，多留 0.5 秒余量；
+# 仍短于 USB 链路 10 秒超时，等待期间设备不会判定未连接
+DONE_FLASH_WAIT_S = 5.5
+
 
 def save(rgb, width, height, scale, path):
     rgb, width, height = screenshot.scale_rgb(rgb, width, height, scale)
@@ -56,9 +60,11 @@ def main():
     link.open()
     try:
         for seq, (name, snap) in enumerate(SCREENS):
-            # 连发两帧并等画面稳定（切换后会立即重画，动画帧间隔最长 600 ms）
+            # 连发两帧并等画面稳定（切换后会立即重画，动画帧间隔最长 600 ms）。
+            # 完成数比设备上一帧大时，固件会用“完成 +N”替换状态行 5 秒，
+            # 所以第一帧之后先等这段提示过去，再发完成数不变的第二帧并截屏。
             link.write_line(encode_state(snap, seq * 2))
-            time.sleep(0.3)
+            time.sleep(DONE_FLASH_WAIT_S)
             link.write_line(encode_state(snap, seq * 2 + 1))
             time.sleep(1.0)
             width, height, rgb = screenshot.capture(link)
