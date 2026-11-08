@@ -53,7 +53,6 @@ static SemaphoreHandle_t s_lock;
 static ar_pair_t s_pair;
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static bool s_trusted;              // 当前连接已确认,数据可以采纳
-static int s_bonds_at_connect;      // 连接建立时的绑定数,用来判断这次是不是新配对
 static ble_addr_t s_pending_addr;   // 待确认连接的对端身份地址
 static uint16_t s_tx_handle;
 static uint8_t s_addr_type;
@@ -235,7 +234,18 @@ static void advertise(void) {
     if (rc != 0 && rc != BLE_HS_EALREADY) ESP_LOGE(TAG, "开始广播失败: %d", rc);
 }
 
-// 加密建立:区分“已确认的老主机重连”与“新配对”
+// 记下当前连接,新连接时清掉上一条连接的信任状态;返回是否是新连接。调用方持有 s_lock。
+// NimBLE 把连接建立事件推迟到读完对端版本之后才上报,已绑定的主机重连时常常先完成加密,
+// 所以连接建立和加密两个事件都会调用这里:同一条连接只初始化一次,
+// 后到的连接建立事件不能清掉加密时已经建立的信任
+static bool link_up(uint16_t conn) {
+    if (s_conn == conn) return false;
+    s_conn = conn;
+    s_trusted = false;
+    return true;
+}
+
+// 加密建立:区分“已确认的老主机重连”与“新配对”,规则见 ar_pair_encrypted()
 static void on_enc_change(uint16_t conn, int status) {
     if (status != 0) {
         ESP_LOGW(TAG, "加密失败(%d),断开;如果电脑删除过配对,请长按上键 5 秒清除设备上的配对", status);
@@ -246,41 +256,44 @@ static void on_enc_change(uint16_t conn, int status) {
     if (ble_gap_conn_find(conn, &desc) != 0) return;
     const int bonds = bond_count();
 
-    ar_pair_action_t act = AR_PAIR_ACT_NONE;
-    bool trusted = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    const bool new_bond = bonds > s_bonds_at_connect;
-    if (!new_bond && desc.sec_state.bonded && s_pair.bonded) {
-        s_trusted = trusted = true;   // 用已确认的绑定加密:就是那台电脑
+    const bool fresh = link_up(conn);   // 加密可能先于连接建立事件到达
+    const ar_pair_action_t act =
+        ar_pair_encrypted(&s_pair, conn, bonds, desc.sec_state.bonded, now_ms());
+    if (act == AR_PAIR_ACT_ACCEPT) {
+        s_trusted = true;   // 用已确认的绑定加密:就是那台电脑
     } else {
         s_pending_addr = desc.peer_id_addr;
-        act = ar_pair_request(&s_pair, conn, false, 0, now_ms());
     }
     xSemaphoreGive(s_lock);
+    if (fresh) ar_line_init(&s_line);
 
     if (act == AR_PAIR_ACT_REJECT) reject_conn(conn, &desc.peer_id_addr);
-    else if (trusted) request_conn_params(conn);
+    else if (act == AR_PAIR_ACT_ACCEPT) request_conn_params(conn);
     else ESP_LOGI(TAG, "新配对,等待在设备上确认");
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
+    case BLE_GAP_EVENT_CONNECT: {
         if (event->connect.status != 0) {
             advertise();
             break;
         }
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        s_conn = event->connect.conn_handle;
-        s_trusted = false;
-        s_bonds_at_connect = bond_count();
+        const bool fresh = link_up(event->connect.conn_handle);
         xSemaphoreGive(s_lock);
-        ar_line_init(&s_line);
+        if (fresh) ar_line_init(&s_line);
         ESP_LOGI(TAG, "主机已连接 %u", event->connect.conn_handle);
-        // 由设备发起安全流程:老主机用已有绑定加密,新主机开始配对
-        ble_gap_security_initiate(event->connect.conn_handle);
+        // 由设备发起安全流程:老主机用已有绑定加密,新主机开始配对。
+        // 主机已经抢先完成加密时不再发起,免得它把安全请求当成要重新配对
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->connect.conn_handle, &desc) != 0 || !desc.sec_state.encrypted) {
+            ble_gap_security_initiate(event->connect.conn_handle);
+        }
         break;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT:
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -405,7 +418,7 @@ esp_err_t ar_ble_start(void) {
         save_paired(false);
         paired = false;
     }
-    ar_pair_init(&s_pair, bonds > 0 && paired);
+    ar_pair_init(&s_pair, paired ? bonds : 0);
     ar_line_init(&s_line);
 
     nimble_port_freertos_init(host_task);
@@ -428,12 +441,14 @@ void ar_ble_get_status(ar_ble_status_t *out) {
 
 void ar_ble_pair_key(bool ok) {
     if (!s_lock) return;
+    // 绑定数在 s_lock 外读取(读取要拿 NimBLE 的锁);待确认的新绑定此时已经写入
+    const int bonds = bond_count();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     const uint16_t conn = s_pair.conn;
     const ble_addr_t addr = s_pending_addr;
     ar_pair_action_t act = ar_pair_key(&s_pair, ok);
     if (act == AR_PAIR_ACT_ACCEPT) {
-        ar_pair_confirmed(&s_pair);
+        ar_pair_confirmed(&s_pair, bonds);
         s_trusted = conn == s_conn;
     }
     xSemaphoreGive(s_lock);
