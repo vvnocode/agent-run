@@ -1,6 +1,3 @@
-# 迁移前的 FoloToy/ai-passport 克隆(迁移完成后删除)
-/firmware/
-
 # Python
 __pycache__/
 *.pyc
