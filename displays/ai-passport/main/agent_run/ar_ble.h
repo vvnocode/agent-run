@@ -31,3 +31,7 @@ void ar_ble_tick(void);
 
 // 清除全部绑定并断开当前连接,之后可以配对新的电脑
 void ar_ble_clear_bonds(void);
+
+// 停止 NimBLE 并释放控制器(ESP-IDF 要求深睡前关闭蓝牙)。未启动时直接返回成功。
+// 调用后本次运行不再恢复蓝牙,之后应立即深睡或重启。不能在 NimBLE 主机任务中调用。
+esp_err_t ar_ble_stop(void);

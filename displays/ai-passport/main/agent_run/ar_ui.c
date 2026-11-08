@@ -3,6 +3,8 @@
 // 布局:标题栏、计数区、宠物场景、三格计数、底栏(普通画面);
 //       标题栏、橙色提醒条、宠物场景、等待列表、底栏(等你处理);
 //       标题栏、未连接提示、变暗的宠物场景(未连接)。
+// 设置菜单打开时,标题栏以下换成一块面板:一级菜单列出音量、亮度两行,二级显示放大的
+// 图标、当前值与由矮到高的档位条。
 // 像素元素(标题栏、大数字、宠物场景、计数格)画在 canvas 的静态缓冲里,见 ar_raster.h;
 // 中文文字用 ar_font_cjk14 的 LVGL 标签。
 #include "ar_ui.h"
@@ -53,6 +55,58 @@ LV_FONT_DECLARE(ar_font_cjk14);
 #define ALERT_NUM_W 48
 #define ALERT_NUM_H 28
 
+// 设置菜单面板:盖住标题栏以下的区域,标题栏的电量与音量图标保持可见。
+// 以下除 MENU_Y 外都是面板内坐标
+#define MENU_Y 44
+#define MENU_H 258
+#define MENU_PAD 14              // 标题、当前值与提示的左右边距
+#define MENU_RIGHT (CONTENT_W - MENU_PAD)
+#define MENU_TITLE_Y 12
+#define MENU_HINT_Y 218
+#define MENU_MAX_BARS 5
+// 设置项图标按 14×12 的格子绘制:一级菜单每格 2 像素,二级每格 3 像素
+#define ICON_GRID_W 14
+#define ICON_GRID_H 12
+#define ROW_ICON_SCALE 2
+#define ROW_ICON_W (ICON_GRID_W * ROW_ICON_SCALE)
+#define ROW_ICON_H (ICON_GRID_H * ROW_ICON_SCALE)
+#define ADJ_ICON_SCALE 3
+#define ADJ_ICON_W (ICON_GRID_W * ADJ_ICON_SCALE)
+#define ADJ_ICON_H (ICON_GRID_H * ADJ_ICON_SCALE)
+// 像素箭头 ‹ ›,与上下调节提示 ▲▼
+#define CHEV_W 6
+#define CHEV_H 10
+#define ARROWS_W 10
+#define ARROWS_H 36
+// 一级菜单的行;ROW_ 开头的偏移以行的左上角为原点
+#define ROW_X 12
+#define ROW_Y 44
+#define ROW_W 180
+#define ROW_H 70
+#define ROW_GAP 10
+#define ROW_BOX 48               // 行内图标底块
+#define ROW_BOX_X 10
+#define ROW_BOX_Y 11
+#define ROW_TEXT_X 70            // 名称与小档位条的左边界
+#define ROW_LABEL_Y 14
+#define ROW_BARS_BOTTOM 56
+#define ROW_VALUE_RIGHT 158
+#define ROW_VALUE_Y 27
+#define ROW_CHEV_X 165
+#define ROW_CHEV_Y 30
+// 二级调节
+#define ADJ_BOX_X 60
+#define ADJ_BOX_Y 46
+#define ADJ_BOX_W 84
+#define ADJ_BOX_H 72
+#define ADJ_BARS_X 18
+#define ADJ_BARS_W 152
+#define ADJ_BARS_BOTTOM 184
+#define ADJ_BAR_MIN_H 10
+#define ADJ_BAR_MAX_H 32
+#define ADJ_ARROWS_X 181
+#define ADJ_ARROWS_Y (ADJ_BARS_BOTTOM - ARROWS_H)
+
 // ---- 静态像素缓冲 -------------------------------------------------------
 LV_DRAW_BUF_DEFINE_STATIC(s_header_buf, CONTENT_W, HEADER_H, LV_COLOR_FORMAT_RGB565);
 LV_DRAW_BUF_DEFINE_STATIC(s_big_buf, BIG_W, BIG_H, LV_COLOR_FORMAT_RGB565);
@@ -61,6 +115,13 @@ LV_DRAW_BUF_DEFINE_STATIC(s_tile0_buf, TILE_CANVAS_W, TILE_CANVAS_H, LV_COLOR_FO
 LV_DRAW_BUF_DEFINE_STATIC(s_tile1_buf, TILE_CANVAS_W, TILE_CANVAS_H, LV_COLOR_FORMAT_RGB565);
 LV_DRAW_BUF_DEFINE_STATIC(s_tile2_buf, TILE_CANVAS_W, TILE_CANVAS_H, LV_COLOR_FORMAT_RGB565);
 LV_DRAW_BUF_DEFINE_STATIC(s_alert_buf, ALERT_NUM_W, ALERT_NUM_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_row0_icon_buf, ROW_ICON_W, ROW_ICON_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_row1_icon_buf, ROW_ICON_W, ROW_ICON_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_row0_chev_buf, CHEV_W, CHEV_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_row1_chev_buf, CHEV_W, CHEV_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_back_buf, CHEV_W, CHEV_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_adj_icon_buf, ADJ_ICON_W, ADJ_ICON_H, LV_COLOR_FORMAT_RGB565);
+LV_DRAW_BUF_DEFINE_STATIC(s_arrows_buf, ARROWS_W, ARROWS_H, LV_COLOR_FORMAT_RGB565);
 
 // ---- LVGL 对象 -----------------------------------------------------------
 static lv_obj_t *s_scr;
@@ -93,6 +154,31 @@ static lv_obj_t *s_disc_hint;
 static lv_obj_t *s_pair_title;
 static lv_obj_t *s_pair_name;
 static lv_obj_t *s_pair_hint;
+// 设置菜单:面板上直接放标题、当前值与提示,一级与二级的其余元素各放一组整组显隐
+static lv_obj_t *s_menu;
+static lv_obj_t *s_menu_title;
+static lv_obj_t *s_menu_value;
+static lv_obj_t *s_menu_hint;
+static lv_obj_t *s_menu_list;
+static lv_obj_t *s_menu_adjust;
+// 一级菜单的行(下标即 ar_menu_item_t)
+typedef struct {
+    lv_obj_t *bg;
+    lv_obj_t *box;
+    lv_obj_t *icon;
+    lv_obj_t *label;
+    lv_obj_t *value;
+    lv_obj_t *chev;
+    lv_obj_t *bars[MENU_MAX_BARS];
+    lv_draw_buf_t *icon_buf;
+    lv_draw_buf_t *chev_buf;
+    int bar_count;
+} menu_row_t;
+static menu_row_t s_rows[AR_MENU_ITEMS];
+// 二级调节
+static lv_obj_t *s_adj_back;
+static lv_obj_t *s_adj_icon;
+static lv_obj_t *s_adj_bars[MENU_MAX_BARS];
 
 // 上一次的视图,用于跳过没有变化的重绘
 static ar_view_t s_last_view;
@@ -176,7 +262,7 @@ static void text_centered(ar_canvas_t *c, int y, const char *s, int scale, uint1
 // 像素元素的绘制
 // ------------------------------------------------------------------------
 
-// 标题栏:左侧 AGENT RUN!,右侧依次为静音、USB、电池图标
+// 标题栏:左侧 AGENT RUN!,右侧从左到右依次为音量、链路(USB 或蓝牙)、电量百分比、电池图标
 static void draw_header(const ar_view_t *v) {
     ar_canvas_t c = canvas_of(&s_header_buf);
     const uint16_t ink = AR_RGB565(C_TEXT2);
@@ -190,14 +276,20 @@ static void draw_header(const ar_view_t *v) {
     ar_raster_rect(&c, bx, by, 1, 9, ink);
     ar_raster_rect(&c, bx + 14, by, 1, 9, ink);
     ar_raster_rect(&c, bx + 15, by + 3, 2, 3, ink);
+    int x = bx - 4;
     if (v->battery_soc >= 0) {
         int soc = v->battery_soc > 100 ? 100 : v->battery_soc;
         int fill = (11 * soc + 50) / 100;
         uint16_t color = soc < 20 ? AR_RGB565(C_ALERT) : ink;
         ar_raster_rect(&c, bx + 2, by + 2, fill, 5, color);
-    }
 
-    int x = bx - 4;
+        // 电池图标左侧的百分比数字,与图标同色
+        char pct[5];
+        snprintf(pct, sizeof(pct), "%d%%", soc);
+        x -= ar_raster_text_width(pct, 1);
+        ar_raster_text(&c, x, 4, pct, 1, color);
+        x -= 4;
+    }
     if (v->link_source == AR_SRC_USB) {
         // USB 插头:两根插针、插头主体、线缆
         x -= 6;
@@ -219,15 +311,20 @@ static void draw_header(const ar_view_t *v) {
         }
         x -= 5;
     }
-    if (v->muted) {
-        // 喇叭 + 叉号
-        x -= 9;
-        ar_raster_rect(&c, x, 5, 2, 4, ink);
-        ar_raster_rect(&c, x + 2, 4, 1, 6, ink);
-        ar_raster_rect(&c, x + 3, 3, 1, 8, ink);
+    // 音量:喇叭 + 档位条(低、中、高依次 1-3 根,由矮到高);静音时为喇叭 + 叉号
+    x -= 10;
+    ar_raster_rect(&c, x, 5, 2, 4, ink);
+    ar_raster_rect(&c, x + 2, 4, 1, 6, ink);
+    ar_raster_rect(&c, x + 3, 3, 1, 8, ink);
+    if (v->volume == 0) {
         for (int i = 0; i < 4; i++) {
             ar_raster_rect(&c, x + 5 + i, 5 + i, 1, 1, ink);
             ar_raster_rect(&c, x + 8 - i, 5 + i, 1, 1, ink);
+        }
+    } else {
+        for (int i = 0; i < v->volume && i < 3; i++) {
+            int h = 2 + 2 * i;
+            ar_raster_rect(&c, x + 5 + 2 * i, 8 - h / 2, 1, h, ink);
         }
     }
     lv_obj_invalidate(s_header);
@@ -269,6 +366,81 @@ static int draw_alert_number(unsigned value) {
     ar_raster_text(&c, 0, 0, text, 4, AR_RGB565(C_ALERT_INK));
     lv_obj_invalidate(s_alert_num);
     return ar_raster_text_width(text, 4);
+}
+
+// 在设置项图标的 14×12 格子里画一块矩形(格子坐标,每格 scale 像素)
+static void icon_cells(ar_canvas_t *c, int scale, int gx, int gy, int gw, int gh, uint16_t color) {
+    ar_raster_rect(c, gx * scale, gy * scale, gw * scale, gh * scale, color);
+}
+
+// 设置项图标,bg 为所在底块的颜色:
+// - 音量:喇叭加三道声波,已达到的档位用亮色,其余用轨道色;静音时喇叭变灰并画叉号;
+// - 亮度:像素太阳。
+// active 为 false(一级菜单里没选中的行)时亮色换成暗色,叉号也一样
+static void draw_setting_icon(lv_draw_buf_t *buf, lv_obj_t *canvas, int scale, uint8_t item, uint8_t volume,
+                              bool active, uint32_t bg) {
+    ar_canvas_t c = canvas_of(buf);
+    const uint16_t ink = AR_RGB565(active ? C_ACCENT : C_DIM);
+    ar_raster_fill(&c, AR_RGB565(bg));
+    if (item == AR_MENU_VOLUME) {
+        const uint16_t body = volume ? ink : AR_RGB565(C_DIM);
+        icon_cells(&c, scale, 1, 4, 3, 4, body);    // 底座
+        icon_cells(&c, scale, 4, 3, 1, 6, body);    // 喇叭口逐列加高
+        icon_cells(&c, scale, 5, 2, 1, 8, body);
+        icon_cells(&c, scale, 6, 1, 1, 10, body);
+        if (volume == 0) {
+            const uint16_t cross = AR_RGB565(active ? C_ALERT : C_DIM);
+            for (int i = 0; i < 5; i++) {
+                icon_cells(&c, scale, 9 + i, 4 + i, 1, 1, cross);
+                icon_cells(&c, scale, 13 - i, 4 + i, 1, 1, cross);
+            }
+        } else {
+            // 第 k 道声波:上端一格、竖线、下端一格,越往外越高
+            for (int k = 0; k < 3; k++) {
+                const uint16_t color = k < volume ? ink : AR_RGB565(C_TRACK);
+                const int x = 8 + 2 * k;
+                icon_cells(&c, scale, x, 4 - k, 1, 1, color);
+                icon_cells(&c, scale, x + 1, 5 - k, 1, 2 + 2 * k, color);
+                icon_cells(&c, scale, x, 7 + k, 1, 1, color);
+            }
+        }
+    } else {
+        icon_cells(&c, scale, 5, 4, 4, 4, ink);   // 日面
+        icon_cells(&c, scale, 6, 1, 2, 2, ink);   // 上下左右四道光
+        icon_cells(&c, scale, 6, 9, 2, 2, ink);
+        icon_cells(&c, scale, 2, 5, 2, 2, ink);
+        icon_cells(&c, scale, 10, 5, 2, 2, ink);
+        icon_cells(&c, scale, 3, 2, 1, 1, ink);   // 斜向四个光点
+        icon_cells(&c, scale, 10, 2, 1, 1, ink);
+        icon_cells(&c, scale, 3, 9, 1, 1, ink);
+        icon_cells(&c, scale, 10, 9, 1, 1, ink);
+    }
+    lv_obj_invalidate(canvas);
+}
+
+// 像素箭头:right 为 true 画 ›,否则画 ‹;由 5 个 2×2 方块排成折线
+static void draw_chevron(lv_draw_buf_t *buf, lv_obj_t *canvas, bool right, uint32_t color, uint32_t bg) {
+    static const uint8_t offset[5] = { 0, 2, 4, 2, 0 };   // 每个方块离尖端反方向的横向偏移
+    ar_canvas_t c = canvas_of(buf);
+    ar_raster_fill(&c, AR_RGB565(bg));
+    for (int i = 0; i < 5; i++) {
+        const int x = right ? offset[i] : CHEV_W - 2 - offset[i];
+        ar_raster_rect(&c, x, 2 * i, 2, 2, AR_RGB565(color));
+    }
+    lv_obj_invalidate(canvas);
+}
+
+// 二级调节右侧的上下箭头 ▲▼:各三行,逐行加宽,上下对称
+static void draw_arrows(void) {
+    ar_canvas_t c = canvas_of(&s_arrows_buf);
+    const uint16_t ink = AR_RGB565(C_DIM);
+    ar_raster_fill(&c, AR_RGB565(C_TILE));
+    for (int i = 0; i < 3; i++) {
+        const int w = 2 + 4 * i;
+        const int x = (ARROWS_W - w) / 2;
+        ar_raster_rect(&c, x, 2 * i, w, 2, ink);
+        ar_raster_rect(&c, x, ARROWS_H - 2 - 2 * i, w, 2, ink);
+    }
 }
 
 // ------------------------------------------------------------------------
@@ -390,6 +562,76 @@ static const char *tool_text(uint8_t tool) {
     }
 }
 
+// 透明、铺满父对象的分组容器,只用来整组显隐
+static lv_obj_t *make_group(lv_obj_t *parent) {
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(o, LV_PCT(100), LV_PCT(100));
+    return o;
+}
+
+// 设置菜单面板:深色面板加一圈细边框,与现有卡片同一风格;最后创建,叠在其他元素之上。
+// 行内元素都直接放在分组里,不再套一层行容器,控制对象嵌套深度(截屏渲染在主任务栈上)
+static void create_menu(void) {
+    static lv_draw_buf_t *const icon_bufs[AR_MENU_ITEMS] = { &s_row0_icon_buf, &s_row1_icon_buf };
+    static lv_draw_buf_t *const chev_bufs[AR_MENU_ITEMS] = { &s_row0_chev_buf, &s_row1_chev_buf };
+    LV_DRAW_BUF_INIT_STATIC(s_row0_icon_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_row1_icon_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_row0_chev_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_row1_chev_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_back_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_adj_icon_buf);
+    LV_DRAW_BUF_INIT_STATIC(s_arrows_buf);
+
+    s_menu = make_box(s_scr, C_TILE, PAD_X, MENU_Y, CONTENT_W, MENU_H, 14);
+    lv_obj_set_style_border_color(s_menu, lv_color_hex(C_LINE2), LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_menu, 1, LV_PART_MAIN);
+    s_menu_list = make_group(s_menu);
+    s_menu_adjust = make_group(s_menu);
+
+    // 一级菜单:每行依次为行底、图标底块、图标、名称、小档位条、当前值、›
+    for (int i = 0; i < AR_MENU_ITEMS; i++) {
+        menu_row_t *r = &s_rows[i];
+        const int y = ROW_Y + i * (ROW_H + ROW_GAP);
+        r->icon_buf = icon_bufs[i];
+        r->chev_buf = chev_bufs[i];
+        r->bar_count = i == AR_MENU_VOLUME ? AR_VOLUME_LEVELS - 1 : AR_BRIGHTNESS_LEVELS;
+        r->bg = make_box(s_menu_list, C_SCENE, ROW_X, y, ROW_W, ROW_H, 12);
+        lv_obj_set_style_border_color(r->bg, lv_color_hex(C_ACCENT), LV_PART_MAIN);
+        r->box = make_box(s_menu_list, C_BG, ROW_X + ROW_BOX_X, y + ROW_BOX_Y, ROW_BOX, ROW_BOX, 10);
+        r->icon = make_canvas(s_menu_list, r->icon_buf, ROW_X + ROW_BOX_X + (ROW_BOX - ROW_ICON_W) / 2,
+                              y + ROW_BOX_Y + (ROW_BOX - ROW_ICON_H) / 2);
+        r->label = make_label(s_menu_list, C_TEXT2, ROW_X + ROW_TEXT_X, y + ROW_LABEL_Y);
+        lv_label_set_text(r->label, i == AR_MENU_VOLUME ? AR_TXT_MENU_VOLUME : AR_TXT_MENU_BRIGHTNESS);
+        // 小档位条:由矮到高,音量 3 根、亮度 5 根,根数多时收窄
+        const int bar_w = r->bar_count <= 3 ? 10 : 8;
+        for (int b = 0; b < r->bar_count; b++) {
+            const int h = 4 + 8 * b / (r->bar_count - 1);
+            r->bars[b] = make_box(s_menu_list, C_TRACK, ROW_X + ROW_TEXT_X + b * (bar_w + 3),
+                                  y + ROW_BARS_BOTTOM - h, bar_w, h, 2);
+        }
+        r->value = make_label(s_menu_list, C_TEXT2, 0, y + ROW_VALUE_Y);
+        r->chev = make_canvas(s_menu_list, r->chev_buf, ROW_X + ROW_CHEV_X, y + ROW_CHEV_Y);
+    }
+
+    // 二级调节:标题前的 ‹、放大的图标、由矮到高的档位条、右侧的 ▲▼
+    s_adj_back = make_canvas(s_menu_adjust, &s_back_buf, MENU_PAD, MENU_TITLE_Y + 4);
+    draw_chevron(&s_back_buf, s_adj_back, false, C_DIM, C_TILE);
+    make_box(s_menu_adjust, C_BG, ADJ_BOX_X, ADJ_BOX_Y, ADJ_BOX_W, ADJ_BOX_H, 12);
+    s_adj_icon = make_canvas(s_menu_adjust, &s_adj_icon_buf, ADJ_BOX_X + (ADJ_BOX_W - ADJ_ICON_W) / 2,
+                             ADJ_BOX_Y + (ADJ_BOX_H - ADJ_ICON_H) / 2);
+    for (int i = 0; i < MENU_MAX_BARS; i++) s_adj_bars[i] = make_box(s_menu_adjust, C_TRACK, 0, 0, 1, 1, 4);
+    make_canvas(s_menu_adjust, &s_arrows_buf, ADJ_ARROWS_X, ADJ_ARROWS_Y);
+    draw_arrows();
+
+    // 标题、当前值与提示两级共用,放在面板上
+    s_menu_title = make_label(s_menu, C_TEXT, MENU_PAD, MENU_TITLE_Y);
+    s_menu_value = make_label(s_menu, C_ACCENT, 0, MENU_TITLE_Y);
+    s_menu_hint = make_label(s_menu, C_DIM, 0, MENU_HINT_Y);
+    show(s_menu, false);
+}
+
 void ar_ui_create(void) {
     // 宠物调色板;变暗版与场景底色按 55% 混合
     const uint32_t colors[AR_SPRITE_COLORS] = {
@@ -457,6 +699,7 @@ void ar_ui_create(void) {
     s_list_divider = make_box(s_list, C_TRACK, 10, 30, CONTENT_W - 20, 1, 0);
     s_others_label = make_label(s_scr, C_TEXT2, PAD_X + 6, 270);
     s_hint_label = make_label(s_scr, C_TEXT2, 0, 270);
+    lv_label_set_text(s_hint_label, AR_TXT_MENU_HINT);
 
     // 未连接:第二行提示(内容随配对状态变化)
     s_disc_hint = make_label(s_scr, C_TEXT2, PAD_X, 60);
@@ -468,6 +711,8 @@ void ar_ui_create(void) {
     s_pair_hint = make_label(s_scr, C_TEXT2, PAD_X, 222);
     lv_label_set_text(s_pair_hint, AR_TXT_PAIR_HINT);
 
+    create_menu();
+
     s_has_last = false;
     lv_screen_load(s_scr);
 }
@@ -476,6 +721,99 @@ void ar_ui_create(void) {
 static void align_right(lv_obj_t *label, int right, int y) {
     lv_obj_update_layout(label);
     lv_obj_set_pos(label, right - lv_obj_get_width(label), y);
+}
+
+// 把标签水平居中到面板内容区
+static void align_center(lv_obj_t *label, int y) {
+    lv_obj_update_layout(label);
+    lv_obj_set_pos(label, (lv_obj_get_width(s_menu_list) - lv_obj_get_width(label)) / 2, y);
+}
+
+// 音量档位名:静音、低、中、高;越界按最高档
+static const char *volume_name(uint8_t level) {
+    static const char *const names[AR_VOLUME_LEVELS] = {
+        AR_TXT_VOLUME_MUTE, AR_TXT_VOLUME_LOW, AR_TXT_VOLUME_MID, AR_TXT_VOLUME_HIGH,
+    };
+    return names[level < AR_VOLUME_LEVELS ? level : AR_VOLUME_LEVELS - 1];
+}
+
+// 设置项的当前值文字与亮起的档位数:音量为档位名与档位数,亮度为百分比与档位序号加一
+static int setting_value(const ar_view_t *v, uint8_t item, lv_obj_t *label) {
+    if (item == AR_MENU_VOLUME) {
+        lv_label_set_text(label, volume_name(v->volume));
+        return v->volume < AR_VOLUME_LEVELS ? v->volume : AR_VOLUME_LEVELS - 1;
+    }
+    lv_label_set_text_fmt(label, "%u%%", (unsigned)ar_brightness_percent(v->brightness));
+    return (v->brightness < AR_BRIGHTNESS_LEVELS ? v->brightness : AR_BRIGHTNESS_LEVELS - 1) + 1;
+}
+
+// 一级菜单的一行:选中时行底加深、加黄色描边,图标、档位条与当前值亮起;
+// 没选中时整行用暗色。静音时选中行的当前值用橙色
+static void update_row(const ar_view_t *v, uint8_t item, bool selected) {
+    menu_row_t *r = &s_rows[item];
+    const int y = ROW_Y + item * (ROW_H + ROW_GAP);
+    const uint32_t row_bg = selected ? C_BG : C_SCENE;
+    const uint32_t box_bg = selected ? C_SCENE : C_BG;
+    lv_obj_set_style_bg_color(r->bg, lv_color_hex(row_bg), LV_PART_MAIN);
+    lv_obj_set_style_border_width(r->bg, selected ? 2 : 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(r->box, lv_color_hex(box_bg), LV_PART_MAIN);
+    draw_setting_icon(r->icon_buf, r->icon, ROW_ICON_SCALE, item, v->volume, selected, box_bg);
+    lv_obj_set_style_text_color(r->label, lv_color_hex(selected ? C_TEXT : C_TEXT2), LV_PART_MAIN);
+
+    const int active = setting_value(v, item, r->value);
+    const bool muted = item == AR_MENU_VOLUME && v->volume == 0;
+    const uint32_t value_color = !selected ? C_TEXT2 : muted ? C_ALERT : C_ACCENT;
+    lv_obj_set_style_text_color(r->value, lv_color_hex(value_color), LV_PART_MAIN);
+    align_right(r->value, ROW_X + ROW_VALUE_RIGHT, y + ROW_VALUE_Y);
+    for (int b = 0; b < r->bar_count; b++) {
+        const uint32_t color = b < active ? (selected ? C_ACCENT : C_DIM) : C_TRACK;
+        lv_obj_set_style_bg_color(r->bars[b], lv_color_hex(color), LV_PART_MAIN);
+    }
+    draw_chevron(r->chev_buf, r->chev, true, selected ? C_ACCENT : C_DIM, row_bg);
+}
+
+// 二级的档位条:n 根由矮到高,前 active 根用强调色,铺满图标下方的宽度
+static void layout_adjust_bars(int n, int active) {
+    const int gap = n <= 3 ? 10 : 8;
+    const int w = (ADJ_BARS_W - gap * (n - 1)) / n;
+    for (int i = 0; i < MENU_MAX_BARS; i++) {
+        show(s_adj_bars[i], i < n);
+        if (i >= n) continue;
+        const int h = ADJ_BAR_MIN_H + (ADJ_BAR_MAX_H - ADJ_BAR_MIN_H) * i / (n - 1);
+        lv_obj_set_pos(s_adj_bars[i], ADJ_BARS_X + i * (w + gap), ADJ_BARS_BOTTOM - h);
+        lv_obj_set_size(s_adj_bars[i], w, h);
+        lv_obj_set_style_bg_color(s_adj_bars[i], lv_color_hex(i < active ? C_ACCENT : C_TRACK), LV_PART_MAIN);
+    }
+}
+
+// 按 view 更新设置菜单:一级显示两行设置项,二级显示正在调节的项
+static void update_menu(const ar_view_t *v, bool open) {
+    show(s_menu, open);
+    if (!open) return;
+    const bool adjust = v->menu_level == AR_MENU_ADJUST;
+    const uint8_t item = v->menu_item < AR_MENU_ITEMS ? v->menu_item : AR_MENU_VOLUME;
+    show(s_menu_list, !adjust);
+    show(s_menu_adjust, adjust);
+    show(s_menu_value, adjust);
+    if (!adjust) {
+        lv_label_set_text(s_menu_title, AR_TXT_MENU_TITLE);
+        lv_obj_set_x(s_menu_title, MENU_PAD);
+        for (uint8_t i = 0; i < AR_MENU_ITEMS; i++) update_row(v, i, i == item);
+        lv_label_set_text(s_menu_hint, AR_TXT_MENU_LIST_HINT);
+    } else {
+        // 标题让出左侧的 ‹;静音时当前值用橙色
+        const bool volume = item == AR_MENU_VOLUME;
+        lv_label_set_text(s_menu_title, volume ? AR_TXT_MENU_VOLUME : AR_TXT_MENU_BRIGHTNESS);
+        lv_obj_set_x(s_menu_title, MENU_PAD + CHEV_W + 6);
+        draw_setting_icon(&s_adj_icon_buf, s_adj_icon, ADJ_ICON_SCALE, item, v->volume, true, C_BG);
+        const int active = setting_value(v, item, s_menu_value);
+        const bool muted = volume && v->volume == 0;
+        lv_obj_set_style_text_color(s_menu_value, lv_color_hex(muted ? C_ALERT : C_ACCENT), LV_PART_MAIN);
+        align_right(s_menu_value, MENU_RIGHT, MENU_TITLE_Y);
+        layout_adjust_bars(volume ? AR_VOLUME_LEVELS - 1 : AR_BRIGHTNESS_LEVELS, active);
+        lv_label_set_text(s_menu_hint, AR_TXT_MENU_ADJUST_HINT);
+    }
+    align_center(s_menu_hint, MENU_HINT_Y);
 }
 
 void ar_ui_update(const ar_view_t *v) {
@@ -489,23 +827,30 @@ void ar_ui_update(const ar_view_t *v) {
     const bool waiting = !pairing && v->screen == AR_SCREEN_WAITING;
     const bool disconnected = !pairing && v->screen == AR_SCREEN_DISCONNECTED;
     const bool normal = !pairing && !waiting && !disconnected;
+    // 设置菜单打开时只保留标题栏,画面内容整体隐藏,被面板盖住的动画也不再重绘;
+    // 配对确认时不显示菜单
+    const bool menu = !pairing && v->menu_level != AR_MENU_CLOSED;
 
     draw_header(v);
 
     // 各组元素的显隐
-    show(s_big, normal);
-    show(s_unit_label, normal);
-    show(s_speed_label, normal);
-    for (int i = 0; i < 4; i++) show(s_bars[i], normal);
-    for (int i = 0; i < 3; i++) show(s_tiles[i], normal);
-    show(s_done_label, normal);
-    show(s_wait_short_label, normal);
-    show(s_alert, waiting);
-    show(s_list, waiting);
-    show(s_others_label, waiting);
-    show(s_hint_label, waiting);
-    show(s_disc_hint, disconnected);
-    show(s_state_label, normal || disconnected);
+    const bool show_normal = normal && !menu;
+    const bool show_waiting = waiting && !menu;
+    const bool show_disconnected = disconnected && !menu;
+    show(s_big, show_normal);
+    show(s_unit_label, show_normal);
+    show(s_speed_label, show_normal);
+    for (int i = 0; i < 4; i++) show(s_bars[i], show_normal);
+    for (int i = 0; i < 3; i++) show(s_tiles[i], show_normal);
+    show(s_done_label, show_normal);
+    show(s_wait_short_label, show_normal);
+    show(s_alert, show_waiting);
+    show(s_list, show_waiting);
+    show(s_others_label, show_waiting);
+    show(s_hint_label, show_waiting);
+    show(s_disc_hint, show_disconnected);
+    show(s_state_label, show_normal || show_disconnected);
+    show(s_scene, !menu);
     show(s_pair_title, pairing);
     show(s_pair_name, pairing);
     show(s_pair_hint, pairing);
@@ -523,9 +868,13 @@ void ar_ui_update(const ar_view_t *v) {
     } else if (normal) {
         const ar_state_t *s = &v->state;
         unsigned total = ar_model_working_total(s);
-        lv_obj_set_style_text_color(s_state_label, lv_color_hex(C_TEXT2), LV_PART_MAIN);
-        lv_label_set_text(s_state_label, state_text(v->screen));
+        // 刚有会话完成时,状态行与底栏“今日完成”用强调色,状态行显示“完成 +N”
+        const uint32_t done_color = v->done_flash ? C_ACCENT : C_TEXT2;
+        lv_obj_set_style_text_color(s_state_label, lv_color_hex(done_color), LV_PART_MAIN);
+        if (v->done_flash) lv_label_set_text_fmt(s_state_label, AR_TXT_DONE_FLASH_FMT, (unsigned)v->done_flash);
+        else lv_label_set_text(s_state_label, state_text(v->screen));
         lv_obj_set_pos(s_state_label, PAD_X, 36);
+        lv_obj_set_style_text_color(s_done_label, lv_color_hex(done_color), LV_PART_MAIN);
 
         int w = draw_big_number(total, v->screen == AR_SCREEN_SLEEP);
         lv_label_set_text(s_unit_label, AR_TXT_UNIT_RUNNING);
@@ -560,11 +909,10 @@ void ar_ui_update(const ar_view_t *v) {
             align_right(s_list_reason[i], CONTENT_W - 10, 6 + 30 * i);
         }
         show(s_list_divider, rows > 1);
-        show(s_list, rows > 0);
+        show(s_list, rows > 0 && !menu);   // 菜单打开时整块隐藏
         lv_obj_set_height(s_list, rows > 1 ? 61 : 31);
 
         lv_label_set_text_fmt(s_others_label, AR_TXT_OTHERS_FMT, ar_model_working_total(s));
-        lv_label_set_text(s_hint_label, v->muted ? AR_TXT_UNMUTE_HINT : AR_TXT_MUTE_HINT);
         align_right(s_hint_label, PAD_X + CONTENT_W - 6, 270);
     }
 
@@ -573,4 +921,6 @@ void ar_ui_update(const ar_view_t *v) {
         ar_ui_animate(pairing ? AR_SCREEN_WAITING : v->screen, 0);
     }
     s_last_pairing = pairing;
+
+    update_menu(v, menu);
 }

@@ -59,6 +59,8 @@ static uint16_t s_tx_handle;
 static uint8_t s_addr_type;
 static char s_name[16];
 static ar_line_buf_t s_line;        // 只在 NimBLE 主机任务中使用
+static bool s_running;              // 主机任务已启动,ar_ble_stop() 据此决定是否需要停止
+static volatile bool s_stopping;    // 正在停止协议栈:主机任务据此不再重新广播
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 
@@ -200,6 +202,7 @@ static const struct ble_gatt_svc_def SERVICES[] = {
 // ------------------------------------------------------------------------
 
 static void advertise(void) {
+    if (s_stopping) return;   // 停止广播时触发的事件不再重启广播,否则协议栈已停用会报错
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -406,6 +409,7 @@ esp_err_t ar_ble_start(void) {
     ar_line_init(&s_line);
 
     nimble_port_freertos_init(host_task);
+    s_running = true;
     ESP_LOGI(TAG, "蓝牙已启动:%s,%s", s_name, s_pair.bonded ? "已配对" : "等待配对");
     return ESP_OK;
 }
@@ -464,4 +468,13 @@ void ar_ble_clear_bonds(void) {
     xSemaphoreGive(s_lock);
     if (conn != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
     ESP_LOGI(TAG, "已清除全部配对");
+}
+
+esp_err_t ar_ble_stop(void) {
+    if (!s_running) return ESP_OK;
+    s_stopping = true;
+    // nimble_port_stop() 阻塞到主机任务退出 nimble_port_run(),之后才能释放控制器
+    if (nimble_port_stop() != 0) return ESP_FAIL;
+    s_running = false;
+    return nimble_port_deinit();
 }

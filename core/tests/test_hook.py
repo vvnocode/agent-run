@@ -62,6 +62,29 @@ class ReducePayloadTest(unittest.TestCase):
         payload = {"session_id": "x" * 500, "hook_event_name": "Stop"}
         self.assertIsNone(ar_hook.reduce_payload(payload, "claude", 1.0))
 
+    def test_background_task_count_is_forwarded_without_details(self):
+        # Stop 载荷里的后台任务只转发数量；命令、描述与定时任务一律不转发
+        payload = {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "回放完成后告诉你结果",
+            "background_tasks": [
+                {"id": "b1", "type": "shell", "status": "running", "description": "回放",
+                 "command": "./replay.sh ~/private/video.mp4"},
+                {"id": "a1", "type": "subagent", "status": "running", "description": "查资料",
+                 "agent_type": "Explore"},
+            ],
+            "session_crons": [{"id": "c1", "schedule": "*/5 * * * *", "recurring": True, "prompt": "check"}],
+        }
+        msg = ar_hook.reduce_payload(payload, "claude", 1.0)
+        self.assertEqual(msg, {"tool": "claude", "event": "Stop", "sid": "s1", "ts": 1.0, "bg": 2})
+
+    def test_background_tasks_absent_or_malformed(self):
+        base = {"session_id": "s1", "hook_event_name": "Stop"}
+        self.assertEqual(ar_hook.reduce_payload(dict(base, background_tasks=[]), "claude", 1.0)["bg"], 0)
+        self.assertNotIn("bg", ar_hook.reduce_payload(dict(base, background_tasks="x"), "claude", 1.0))
+        self.assertNotIn("bg", ar_hook.reduce_payload(base, "codex", 1.0))
+
 
 class HookProcessTest(unittest.TestCase):
     def setUp(self):

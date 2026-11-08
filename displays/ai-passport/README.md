@@ -29,7 +29,7 @@ idf.py -C displays/ai-passport build
 launchctl bootout gui/$(id -u)/local.agent-run
 ```
 
-- **第一次烧录（替换出厂固件）：** 把合并镜像从 `0x0` 写入。这会清空 NVS，包括亮度、静音设置和蓝牙配对。
+- **第一次烧录（替换出厂固件）：** 把合并镜像从 `0x0` 写入。这会清空 NVS，包括亮度、音量设置和蓝牙配对。
 
   ```bash
   esptool.py --chip esp32c3 -p /dev/cu.usbmodem101 -b 460800 write_flash 0x0 displays/ai-passport/build/agent-run-ai-passport-full.bin
@@ -49,11 +49,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.agent-run.plist
 
 | 操作 | 作用 |
 |---|---|
-| 上 / 下 短按 | 调亮度（5 档，保存） |
-| 确定 长按 | 切换静音（保存） |
+| 确定 单击 | 打开设置菜单（音量、亮度），默认选中音量 |
+| 菜单里 上 / 下 | 切换选中项；进入调节后加减档位并保存 |
+| 菜单里 确定 单击 / 双击 | 进入选中项 / 返回上一级 |
+| 菜单无操作 | 菜单 10 秒、调节界面 3 秒后回首页 |
 | 上 按住 5 秒 | 清除蓝牙配对，之后可以配对另一台电脑 |
 | 配对确认时 确定 / 下 | 接受 / 拒绝 |
-| 任意键 | 背光关闭时只唤醒屏幕 |
+| 任意键 | 背光关闭时只唤醒屏幕；深睡时唤醒设备 |
 
 ## 截屏
 

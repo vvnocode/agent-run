@@ -52,6 +52,11 @@ def reduce_payload(payload, tool, now):
     ntype = _short_str(payload.get("notification_type"))
     if ntype is not None:
         msg["ntype"] = ntype
+    # Claude Code 的 Stop 载荷带 background_tasks（进行中的后台 shell、子代理、Monitor 等），
+    # 守护进程据此区分“这一轮结束”与“暂停等后台任务唤醒”。只转发数量，命令与描述一律不转发
+    tasks = payload.get("background_tasks")
+    if isinstance(tasks, list):
+        msg["bg"] = len(tasks)
     # 子代理事件只标记来源，不转发子代理的 id 与类型
     if payload.get("agent_id"):
         msg["agent"] = True

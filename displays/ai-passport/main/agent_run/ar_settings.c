@@ -20,9 +20,9 @@ static void save_u8(const char *key, uint8_t value) {
     nvs_close(h);
 }
 
-void ar_settings_load(uint8_t *brightness_level, bool *muted) {
+void ar_settings_load(uint8_t *brightness_level, uint8_t *volume_level) {
     *brightness_level = AR_BRIGHTNESS_DEFAULT;
-    *muted = false;
+    *volume_level = AR_VOLUME_DEFAULT;
 
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
@@ -35,7 +35,11 @@ void ar_settings_load(uint8_t *brightness_level, bool *muted) {
     if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;   // 首次运行还没有命名空间
     uint8_t v;
     if (nvs_get_u8(h, "bright", &v) == ESP_OK && v < AR_BRIGHTNESS_LEVELS) *brightness_level = v;
-    if (nvs_get_u8(h, "mute", &v) == ESP_OK) *muted = v != 0;
+    if (nvs_get_u8(h, "vol", &v) == ESP_OK && v < AR_VOLUME_LEVELS) {
+        *volume_level = v;
+    } else if (nvs_get_u8(h, "mute", &v) == ESP_OK && v != 0) {
+        *volume_level = 0;   // 改版前只有静音开关:沿用静音,之后按音量档位保存
+    }
     nvs_close(h);
 }
 
@@ -43,6 +47,6 @@ void ar_settings_save_brightness(uint8_t level) {
     save_u8("bright", level);
 }
 
-void ar_settings_save_muted(bool muted) {
-    save_u8("mute", muted ? 1 : 0);
+void ar_settings_save_volume(uint8_t level) {
+    save_u8("vol", level);
 }

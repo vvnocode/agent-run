@@ -1,7 +1,7 @@
 // main/agent_run/ar_model.h —— Agent Run! 画面选择与交互规则(纯 C,可宿主测试)。
 //
 // 把“收到的状态 + 时间”换算成要显示的画面、动画帧间隔、速度条格数、
-// 提示音是否该响、亮度与背光。规则见设计方案 §7.2、§7.5。
+// 通知与提示音、音量、亮度、设置菜单与背光。规则见设计方案 §7.2、§7.5 与无线方案 §4.4、§7.4。
 #pragma once
 
 #include <stdbool.h>
@@ -13,19 +13,42 @@
 #define AR_LINK_TIMEOUT_USB_MS 10000u
 #define AR_LINK_TIMEOUT_BLE_MS 15000u
 
-// 电池供电时,状态这么久没变化就把背光降到 AR_DIM_PERCENT
-#define AR_DIM_AFTER_MS 30000u
+// 低亮度的背光百分比(设定亮度更低时用设定值)
 #define AR_DIM_PERCENT 20
 
-// 两次提示音的最小间隔
+// 插着 USB 主机时:最近一次亮屏事件后多久降到低亮度、多久熄屏(保护屏幕与背光)
+#define AR_USB_DIM_AFTER_MS 300000u
+#define AR_USB_OFF_AFTER_MS 1800000u
+
+// 电池供电时:亮屏期间一直用低亮度,最近一次亮屏事件后多久熄屏
+#define AR_BATTERY_OFF_AFTER_MS 30000u
+
+// 两次“等你处理”提示音的最小间隔
 #define AR_CHIME_MIN_INTERVAL_MS 30000u
 
-// 进入“未连接”或最后一次按键后,背光保持的时间
+// 完成提示音与上一次任意提示音的最小间隔,其间的完成合并、不补响
+#define AR_DONE_CHIME_MIN_INTERVAL_MS 10000u
+
+// 画面上“完成 +N”提示的显示时长
+#define AR_DONE_FLASH_MS 5000u
+
+// 设置菜单无按键多久回首页,最后一次按键起算:一级菜单与二级调节各自计时
+#define AR_MENU_LIST_TIMEOUT_MS 10000u
+#define AR_MENU_ADJUST_TIMEOUT_MS 3000u
+
+// “未连接”且无亮屏事件持续这么久后关背光(插着 USB 主机时也生效)
 #define AR_BACKLIGHT_IDLE_MS 300000u
+
+// 电池供电时,“未连接”且无按键持续这么久就进入深睡(晚于关背光)
+#define AR_DEEP_SLEEP_AFTER_MS 1800000u
 
 // 亮度档位
 #define AR_BRIGHTNESS_LEVELS 5
 #define AR_BRIGHTNESS_DEFAULT 3
+
+// 音量档位:0 静音、1 低、2 中、3 高;中档与改版前的固定音量相同
+#define AR_VOLUME_LEVELS 4
+#define AR_VOLUME_DEFAULT 2
 
 typedef enum {
     AR_SCREEN_DISCONNECTED = 0,   // 未连接电脑
@@ -53,36 +76,125 @@ uint16_t ar_model_frame_interval_ms(ar_screen_t screen);
 // 速度条点亮的格数(0-4)
 uint8_t ar_model_speed_bars(ar_screen_t screen);
 
-// 提示音状态:等你处理的数量增加时响一次,两次至少间隔 30 秒,静音时不响
+// 状态帧带来的通知:等你处理增加、有会话完成。每收到一帧新状态调用一次 ar_notice_update()。
 typedef struct {
-    uint8_t last_wn;
-    bool has_chimed;
-    uint32_t last_chime_ms;
+    uint8_t wn;          // 上一帧的等你处理数;掉线不清零,恢复后仍未处理的不重复提醒
+    bool has_done;       // 本次在线期间是否已有完成数基准
+    uint16_t done;       // 上一帧的今日完成数
+} ar_notice_t;
+
+typedef struct {
+    bool waiting;        // 等你处理的数量增加了
+    uint16_t completed;  // 新完成的轮数,0 表示没有
+} ar_notice_ev_t;
+
+void ar_notice_init(ar_notice_t *n);
+
+// 链路离线时调用:恢复后的第一帧完成数只作基准,离线期间累计的完成不再提示
+void ar_notice_offline(ar_notice_t *n);
+
+// 与上一帧比较,得出本帧的通知。完成数变小(跨天清零)只更新基准。
+ar_notice_ev_t ar_notice_update(ar_notice_t *n, uint8_t wn, uint16_t done);
+
+// 提示音种类
+typedef enum {
+    AR_CHIME_NONE = 0,
+    AR_CHIME_WAITING,   // 等你处理
+    AR_CHIME_DONE,      // 有会话完成
+} ar_chime_kind_t;
+
+// 提示音节流状态
+typedef struct {
+    bool has_waiting;
+    uint32_t last_waiting_ms;   // 上一次“等你处理”提示音
+    bool has_any;
+    uint32_t last_any_ms;       // 上一次任意提示音
 } ar_chime_t;
 
 void ar_chime_init(ar_chime_t *c);
 
-// 每收到一帧调用一次;返回 true 表示现在应播放提示音。now_ms 允许回绕。
-bool ar_chime_update(ar_chime_t *c, uint8_t wn, uint32_t now_ms, bool muted);
+// 按本帧的通知选择提示音,now_ms 允许回绕:
+// - 等你处理优先,两次至少间隔 AR_CHIME_MIN_INTERVAL_MS;
+// - 完成与上一次任意提示音至少间隔 AR_DONE_CHIME_MIN_INTERVAL_MS,其间的完成合并、不补响;
+// - 静音时不响,也不计入间隔。
+ar_chime_kind_t ar_chime_pick(ar_chime_t *c, ar_notice_ev_t ev, uint32_t now_ms, bool muted);
+
+// 音量档位 → 播放音量百分比;越界按最高档
+uint8_t ar_volume_percent(uint8_t level);
+
+// 加减音量:到静音与最高档时停住;越界先按最高档处理
+uint8_t ar_volume_step(uint8_t level, int delta);
 
 // 亮度档位 → 背光百分比;越界按最高档
 uint8_t ar_brightness_percent(uint8_t level);
 
-// 调整亮度档位并限制在合法范围
+// 加减亮度:到最低档与最高档时停住;越界先按最高档处理
 uint8_t ar_brightness_step(uint8_t level, int delta);
+
+// 设置菜单的层级
+typedef enum {
+    AR_MENU_CLOSED = 0,   // 首页,菜单未打开
+    AR_MENU_LIST,         // 一级菜单:选择设置项
+    AR_MENU_ADJUST,       // 二级:调节选中项
+} ar_menu_level_t;
+
+// 一级菜单的设置项,按显示顺序
+typedef enum {
+    AR_MENU_VOLUME = 0,
+    AR_MENU_BRIGHTNESS,
+    AR_MENU_ITEMS,
+} ar_menu_item_t;
+
+// 菜单用到的按键:上、下、单击确定、双击确定(返回上一级)
+typedef enum {
+    AR_KEY_UP = 0,
+    AR_KEY_DOWN,
+    AR_KEY_OK,
+    AR_KEY_BACK,
+} ar_key_t;
+
+typedef struct {
+    uint8_t level;   // ar_menu_level_t
+    uint8_t item;    // ar_menu_item_t:一级菜单的选中项,二级时为正在调节的项
+} ar_menu_t;
+
+void ar_menu_init(ar_menu_t *m);
+
+// 处理一次按键,返回二级里对选中项的调节量(上键 +1、下键 -1),其余情况返回 0:
+// - 首页:单击确定打开一级菜单并选中音量,其他键不起作用;
+// - 一级:上下键切换选中项(到头停住),单击确定进入二级,双击确定回首页;
+// - 二级:上下键调节,单击确定不起作用,双击确定回一级并保留选中项。
+int ar_menu_key(ar_menu_t *m, ar_key_t key);
+
+// 距最近一次按键已满所在层的时限(一级 AR_MENU_LIST_TIMEOUT_MS、二级
+// AR_MENU_ADJUST_TIMEOUT_MS)时关闭菜单回首页;二级超时也直接回首页
+void ar_menu_tick(ar_menu_t *m, uint32_t ms_since_key);
 
 // 背光计算的输入
 typedef struct {
     ar_screen_t screen;
-    bool on_usb_power;          // 接着 USB 主机(此时不省电)
+    bool on_usb_power;          // 接着 USB 主机
     uint8_t level;              // 用户设定的亮度档位
-    uint32_t ms_since_change;   // 距画面内容最近一次变化
-    uint32_t ms_since_key;      // 距最近一次按键,从未按过传 UINT32_MAX
+    uint32_t ms_since_wake;     // 距最近一次亮屏事件(按键、通知、连上电脑、配对确认、开机),从未发生传 UINT32_MAX
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
 } ar_backlight_in_t;
 
-// 背光百分比,0 表示关闭:
-// - “未连接”超过 5 分钟且 5 分钟内无按键时关闭;
-// - 电池供电、不在“等你处理”、30 秒内无按键且内容 30 秒没变化时降到 AR_DIM_PERCENT;
-// - 其余情况用设定亮度。
+// 背光百分比,0 表示熄屏。“低亮度”为 AR_DIM_PERCENT 与设定亮度中较低者。
+// - 电池供电:亮屏事件后 AR_BATTERY_OFF_AFTER_MS 内用低亮度,之后熄屏;
+// - 插着 USB 主机且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏;
+// - 插着 USB 主机:亮屏事件后 AR_USB_DIM_AFTER_MS 内用设定亮度,
+//   AR_USB_OFF_AFTER_MS 内用低亮度,之后熄屏。
 uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in);
+
+// 深睡判定的输入
+typedef struct {
+    bool on_usb_power;          // 接着 USB 主机(只认主机在线,充电宝或主机睡眠时为 false)
+    bool battery_present;       // 电量计读得到电量;读不到时可能没装电池,只靠 USB 供电
+    bool confirming;            // 正在等用户确认配对
+    uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
+    uint32_t ms_since_key;      // 距最近一次按键,从未按过传 UINT32_MAX
+} ar_sleep_in_t;
+
+// 是否该进入深睡:没接 USB 主机、电量计正常、不在配对确认,且“未连接”与无按键
+// 都已满 AR_DEEP_SLEEP_AFTER_MS。在线时(包括“睡觉中”)从不深睡,以免错过“等你处理”。
+bool ar_model_should_deep_sleep(const ar_sleep_in_t *in);

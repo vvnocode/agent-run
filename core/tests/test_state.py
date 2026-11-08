@@ -223,6 +223,58 @@ class AggregatorTest(unittest.TestCase):
         self.assertEqual(other.snapshot().done, 0)
         self.assertEqual(same.done_record(), ("2026-11-08", 5))
 
+    # ---- 后台任务(Claude Code Stop 载荷的 background_tasks) ----------------
+
+    def test_stop_with_background_tasks_keeps_working_without_counting(self):
+        # 一轮结束时仍有后台任务在跑：会话只是暂停等唤醒，继续计入工作中，不计完成
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "s1", 1000.0))
+        a.handle(ev("claude", "Stop", "s1", 1001.0, bg=1))
+        snap = a.snapshot()
+        self.assertEqual((snap.cc, snap.done), (1, 0))
+
+    def test_background_session_counts_done_once_when_finally_stopped(self):
+        # 后台任务结束后会话被唤醒，可能再起后台任务；最后一次不带后台任务的 Stop 才计完成
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "s1", 1000.0))
+        a.handle(ev("claude", "Stop", "s1", 1001.0, bg=1))
+        a.handle(ev("claude", "PostToolUse", "s1", 1500.0, tool_name="Bash"))
+        a.handle(ev("claude", "Stop", "s1", 1501.0, bg=2))
+        self.assertEqual(a.snapshot().done, 0)
+        a.handle(ev("claude", "Stop", "s1", 2000.0, bg=0))
+        snap = a.snapshot()
+        self.assertEqual((snap.cc, snap.done), (0, 1))
+
+    def test_background_session_outlives_working_timeout(self):
+        # 后台回放常跑 40–50 分钟且期间没有任何事件，不能按工作中的 15 分钟回收
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "s1", 1000.0))
+        a.handle(ev("claude", "Stop", "s1", 1001.0, bg=1))
+        self.clock.t = 1001.0 + 50 * 60
+        a.tick()
+        self.assertEqual(a.snapshot().cc, 1)
+
+    def test_background_session_times_out_after_2_hours(self):
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "s1", 1000.0))
+        a.handle(ev("claude", "Stop", "s1", 1001.0, bg=1))
+        self.clock.t = 1001.0 + 2 * 3600 - 1
+        self.assertFalse(a.tick())
+        self.clock.t = 1001.0 + 2 * 3600 + 1
+        self.assertTrue(a.tick())
+        snap = a.snapshot()
+        self.assertEqual((snap.cc, snap.done), (0, 0))
+
+    def test_invalid_background_count_is_ignored(self):
+        # 非整数（含布尔值）的 bg 视同没有后台任务，按普通 Stop 处理
+        a = self.agg
+        for i, bad in enumerate(("2", True, -1)):
+            sid = "s%d" % i
+            a.handle(ev("claude", "UserPromptSubmit", sid, 1000.0 + i))
+            a.handle(ev("claude", "Stop", sid, 1000.5 + i, bg=bad))
+        snap = a.snapshot()
+        self.assertEqual((snap.cc, snap.done), (0, 3))
+
     # ---- 异步提问(Codex 桌面端 request_user_input_async) -------------------
 
     def test_async_question_stays_pending_while_agent_keeps_working(self):

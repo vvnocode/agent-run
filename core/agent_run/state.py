@@ -17,6 +17,9 @@ RECENT_EVENTS = 20
 IDLE = "idle"
 WORKING = "working"
 WAITING = "waiting"
+# 后台运行：一轮已结束，但仍有后台任务在跑，任务结束后会话会被唤醒继续。
+# 计入工作中，不计完成；超时比工作中长，因为后台任务期间没有任何 hook 事件
+BACKGROUND = "background"
 
 # 等你处理的原因代号：A = 等待授权，Q = 等你回答
 APPROVE = "A"
@@ -25,6 +28,8 @@ QUESTION = "Q"
 # 超时回收时限（秒）。工作中 15 分钟大于 Claude Code Bash 工具 10 分钟的上限
 WORKING_TIMEOUT = 15 * 60
 WAITING_TIMEOUT = 60 * 60
+# 后台运行 2 小时没有事件即回收：容纳常见的长回放、长构建，又不让异常退出的会话长期占着跑速
+BACKGROUND_TIMEOUT = 2 * 3600
 IDLE_TIMEOUT = 24 * 3600
 
 # 可由 config.json 覆盖的映射规则：工具名或通知类型改名时不必改代码
@@ -46,6 +51,14 @@ _TO_IDLE = "to_idle"
 
 # 对外快照：各工具工作中数量、今日完成数、等你处理总数与按先后排序的等待列表
 Snapshot = namedtuple("Snapshot", "cc cx ds done wn waiting")
+
+
+def _background_count(msg):
+    """Stop 事件携带的后台任务数（ar_hook.py 转发的 bg）；缺失或不是整数时按 0 处理。"""
+    bg = msg.get("bg")
+    if isinstance(bg, bool) or not isinstance(bg, int):
+        return 0
+    return bg
 
 
 def local_day(t):
@@ -134,6 +147,8 @@ class Aggregator:
                 s.to_idle()
             elif s.state == WAITING and quiet > WAITING_TIMEOUT:
                 s.to_idle()
+            elif s.state == BACKGROUND and quiet > BACKGROUND_TIMEOUT:
+                s.to_idle()
             elif s.state == IDLE and quiet > IDLE_TIMEOUT:
                 del self._sessions[key]
         return self.snapshot() != before
@@ -157,7 +172,7 @@ class Aggregator:
             if s.is_waiting():
                 since, reason = s.waiting_item()
                 waiting.append((since, tool, reason))
-            elif s.state == WORKING:
+            elif s.state in (WORKING, BACKGROUND):
                 working[tool] += 1
         waiting.sort(key=lambda item: item[0])
         items = [(tool, reason) for _, tool, reason in waiting]
@@ -238,6 +253,12 @@ class Aggregator:
         if target is None:
             return  # 只刷新活动时间（如 SessionStart、未关注的通知类型）
         if target == _STOP:
+            if _background_count(msg) > 0:
+                # 仍有后台任务：会话只是暂停等唤醒，留到最后一次不带后台任务的 Stop 再计完成
+                s.state = BACKGROUND
+                s.reason = None
+                s.wait_since = None
+                return
             self._roll_day(self._clock())
             if s.state != IDLE:
                 self._done += 1
