@@ -2,11 +2,16 @@
 //
 // 电脑上的 agent-run 采集程序经 USB 串口或蓝牙推送 Claude Code / Codex / dsh 的会话状态,
 // 本固件负责显示:工作中的会话越多,宠物跑得越快;有会话等你处理时停下招手并响一声;
-// 有会话完成时显示“完成 +N”并响一声轻提示音。
-// 设计见外层仓库 docs/specs/2026-11-08-agent-run-design.md 与 -wireless-design.md。
+// 有会话完成时显示“完成 +N”并响一声轻提示音。Claude Code、Codex 各有一个专用页面,
+// 显示 5 小时与每周用量、任务计数。
+// 设计见外层仓库 docs/specs/2026-11-08-agent-run-design.md、-wireless-design.md
+// 与 2026-11-09-agent-run-agent-pages-design.md。
 //
 // 按键(设置菜单的规则见 ar_menu_key()):
-//   首页   确定 单击  打开设置菜单(一级:音量、亮度,默认选中音量);上下键暂不起作用
+//   首页与专用页面
+//          确定 单击  打开设置菜单(一级:音量、亮度,默认选中音量)
+//          下 / 上    依次切换 首页 → Claude Code → Codex → 首页(上键反向),见 ar_page_step();
+//                     等你处理、未连接时不切页,这两种画面优先显示,清空后回到所在页面
 //   一级   上 / 下    切换选中项;确定单击进入二级;确定双击回首页;10 秒无按键回首页
 //   二级   上 / 下    调节并保存(调音量时按新音量试听,调亮度时按设定亮度点亮);
 //                     确定双击回一级;3 秒无按键回首页
@@ -89,6 +94,10 @@ static int64_t s_done_flash_until_us;       // “完成 +N”提示的截止时
 static ar_keywake_t s_keywake;              // 熄屏时按键亮屏,并吞掉这次手势的动作
 static ar_power_t s_power;                  // 供电方式,拔掉 USB 时据此补记亮屏事件
 static int64_t s_dark_since_us;             // 屏幕熄灭的时刻,亮着时为 0
+static uint8_t s_page = AR_PAGE_HOME;       // 用户所在页面(ar_page_t);熄屏不变,重启回首页
+static ar_screen_t s_screen = AR_SCREEN_DISCONNECTED;   // 上一轮选出的画面,按键处理据此判断能否切页
+static ar_notice_t s_agent_notice[AR_AGENT_TOOLS];      // 按工具识别新完成,用于专用页面的完成高亮
+static int64_t s_agent_flash_until_us[AR_AGENT_TOOLS];  // 专用页面“今日完成”高亮的截止时刻
 
 // 两个时刻之间的毫秒数;from 为 0(从未发生)时返回 UINT32_MAX
 static uint32_t ms_since(int64_t from_us, int64_t now_us) {
@@ -165,6 +174,14 @@ static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
         return;
     }
     if (in->event == BSP_BTN_LONG) return;
+
+    // 菜单未打开、画面为普通画面时,上下键切换页面;双击按两步处理,与菜单里一致
+    if ((in->btn == BSP_BTN_UP || in->btn == BSP_BTN_DOWN) &&
+        ar_page_keys_active(s_screen, s_menu.level != AR_MENU_CLOSED, pairing)) {
+        const int steps = in->event == BSP_BTN_DOUBLE ? 2 : 1;
+        s_page = ar_page_step(s_page, in->btn == BSP_BTN_DOWN ? steps : -steps);
+        return;
+    }
 
     // 换算成菜单按键:确定单击为进入,双击为返回上一级;上下键快速连按两下会被
     // 识别成双击,按两步处理,免得调节时丢档
@@ -254,6 +271,7 @@ static void app_task(void *arg) {
         const bool alive = link.has_state &&
                            ar_model_link_alive(ms_since(link.last_usb_us, now), ms_since(link.last_ble_us, now));
         const ar_screen_t screen = ar_model_screen(&link.state, alive);
+        s_screen = screen;
 
         // 连上电脑与出现配对请求都点亮屏幕;掉线后,恢复时的第一帧完成数只作基准
         if (alive && !was_alive) s_last_wake_us = now;
@@ -274,6 +292,15 @@ static void app_task(void *arg) {
                 s_done_flash_count = now < s_done_flash_until_us ? (uint16_t)(s_done_flash_count + ev.completed)
                                                                  : ev.completed;
                 s_done_flash_until_us = now + (int64_t)AR_DONE_FLASH_MS * 1000;
+            }
+        }
+        // 按工具识别新完成:A 帧只在变化时到达,逐轮比较即可;掉线后恢复的第一帧只作基准
+        for (int i = 0; i < AR_AGENT_TOOLS; i++) {
+            if (!alive) {
+                ar_notice_offline(&s_agent_notice[i]);
+            } else if (link.has_agent[i]) {
+                const ar_notice_ev_t ev = ar_notice_update(&s_agent_notice[i], link.agent[i].wn, link.agent[i].done);
+                if (ev.completed > 0) s_agent_flash_until_us[i] = now + (int64_t)AR_DONE_FLASH_MS * 1000;
             }
         }
 
@@ -336,6 +363,14 @@ static void app_task(void *arg) {
         view.pair_cleared = now < s_cleared_until_us;
         view.ble_bonded = ble.bonded;
         memcpy(view.ble_name, ble.name, sizeof(view.ble_name));
+        // 专用页面:等你处理、未连接时换算成首页;工具下标即 ar_tool_t(CC、CX)
+        view.page = ar_page_shown(s_page, screen);
+        if (view.page != AR_PAGE_HOME) {
+            const int tool = view.page == AR_PAGE_CC ? AR_TOOL_CC : AR_TOOL_CX;
+            view.has_agent = link.has_agent[tool];
+            if (view.has_agent) memcpy(&view.agent, &link.agent[tool], sizeof(view.agent));
+            view.agent_flash = now < s_agent_flash_until_us[tool];
+        }
 
         // 背光降档时动画放慢一倍
         const ar_screen_t want_anim = ble.confirming ? AR_SCREEN_WAITING : screen;
@@ -348,7 +383,8 @@ static void app_task(void *arg) {
                 anim_screen = want_anim;
                 tick = 0;
                 next_frame_us = now + (int64_t)interval_ms * 1000;
-            } else if (now >= next_frame_us && backlight > 0) {
+            } else if (now >= next_frame_us && backlight > 0 && view.page == AR_PAGE_HOME) {
+                // 专用页面不显示宠物场景,不必重画;回到首页时 ar_ui_update 会立刻重画一帧
                 tick++;
                 ar_ui_animate(anim_screen, tick);
                 next_frame_us = now + (int64_t)interval_ms * 1000;
@@ -391,6 +427,7 @@ void app_main(void) {
     ar_chime_init(&s_chime);
     ar_keywake_init(&s_keywake);
     ar_power_init(&s_power);
+    for (int i = 0; i < AR_AGENT_TOOLS; i++) ar_notice_init(&s_agent_notice[i]);
 
     if (bsp_audio_init() == ESP_OK) {
         if (ar_sound_init() != ESP_OK) ESP_LOGW(TAG, "提示音任务创建失败");

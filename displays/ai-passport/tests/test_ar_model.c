@@ -447,7 +447,77 @@ static void test_no_deep_sleep_when_powered_or_pairing(void) {
     assert(!ar_model_should_deep_sleep(&in));
 }
 
+// 工具专用页面:首页 → Claude Code → Codex → 首页,下键前进、上键后退(专用页面方案 §4.1)
+static void test_page_cycle(void) {
+    assert(ar_page_step(AR_PAGE_HOME, +1) == AR_PAGE_CC);
+    assert(ar_page_step(AR_PAGE_CC, +1) == AR_PAGE_CX);
+    assert(ar_page_step(AR_PAGE_CX, +1) == AR_PAGE_HOME);
+    assert(ar_page_step(AR_PAGE_HOME, -1) == AR_PAGE_CX);
+    assert(ar_page_step(AR_PAGE_CX, -1) == AR_PAGE_CC);
+    assert(ar_page_step(AR_PAGE_CC, -1) == AR_PAGE_HOME);
+    assert(ar_page_step(AR_PAGE_CC, +2) == AR_PAGE_HOME);   // 下键双击按两步
+    assert(ar_page_step(AR_PAGE_CC, -2) == AR_PAGE_CX);
+    assert(ar_page_step(200, +1) == AR_PAGE_CC);            // 状态损坏时从首页算起
+}
+
+// 画面优先级:等你处理、未连接覆盖专用页面,清空后回到原页面;这些时候上下键不切页
+static void test_page_priority_and_keys(void) {
+    assert(ar_page_shown(AR_PAGE_CX, AR_SCREEN_WAITING) == AR_PAGE_HOME);
+    assert(ar_page_shown(AR_PAGE_CX, AR_SCREEN_DISCONNECTED) == AR_PAGE_HOME);
+    assert(ar_page_shown(AR_PAGE_CX, AR_SCREEN_RUN) == AR_PAGE_CX);
+    assert(ar_page_shown(AR_PAGE_CC, AR_SCREEN_SLEEP) == AR_PAGE_CC);
+    assert(ar_page_shown(AR_PAGE_HOME, AR_SCREEN_WALK) == AR_PAGE_HOME);
+    assert(ar_page_shown(9, AR_SCREEN_WALK) == AR_PAGE_HOME);
+
+    assert(ar_page_keys_active(AR_SCREEN_RUN, false, false));
+    assert(ar_page_keys_active(AR_SCREEN_SLEEP, false, false));
+    assert(!ar_page_keys_active(AR_SCREEN_RUN, true, false));         // 设置菜单打开
+    assert(!ar_page_keys_active(AR_SCREEN_RUN, false, true));         // 配对确认
+    assert(!ar_page_keys_active(AR_SCREEN_WAITING, false, false));    // 等你处理
+    assert(!ar_page_keys_active(AR_SCREEN_DISCONNECTED, false, false));
+}
+
+// 距重置时间的文字:不足 1 小时按分钟,不足 1 天按小时与分钟,否则按天与小时
+static void test_reset_text(void) {
+    char buf[48];
+    ar_reset_text(1, buf, sizeof(buf));
+    assert(strcmp(buf, "1 分钟后重置") == 0);
+    ar_reset_text(59, buf, sizeof(buf));
+    assert(strcmp(buf, "59 分钟后重置") == 0);
+    ar_reset_text(60, buf, sizeof(buf));
+    assert(strcmp(buf, "1 小时 0 分后重置") == 0);
+    ar_reset_text(135, buf, sizeof(buf));
+    assert(strcmp(buf, "2 小时 15 分后重置") == 0);
+    ar_reset_text(1439, buf, sizeof(buf));
+    assert(strcmp(buf, "23 小时 59 分后重置") == 0);
+    ar_reset_text(1440, buf, sizeof(buf));
+    assert(strcmp(buf, "1 天 0 小时后重置") == 0);
+    ar_reset_text(3 * 1440 + 5 * 60 + 59, buf, sizeof(buf));
+    assert(strcmp(buf, "3 天 5 小时后重置") == 0);
+    ar_reset_text(AR_RESET_UNKNOWN, buf, sizeof(buf));
+    assert(strcmp(buf, "重置时间未知") == 0);
+    ar_reset_text(0, buf, sizeof(buf));
+    assert(strcmp(buf, "1 分钟后重置") == 0);
+    // 缓冲区不够时截断但仍以 NUL 结尾
+    char tiny[4];
+    ar_reset_text(135, tiny, sizeof(tiny));
+    assert(strlen(tiny) < sizeof(tiny));
+}
+
+// 用量 ≥80% 时进度条改用警示色;暂无数据、无此限额不算
+static void test_usage_alert(void) {
+    assert(!ar_usage_alert(79));
+    assert(ar_usage_alert(80));
+    assert(ar_usage_alert(100));
+    assert(!ar_usage_alert(AR_USAGE_UNKNOWN));
+    assert(!ar_usage_alert(AR_USAGE_NO_LIMIT));
+}
+
 int main(void) {
+    test_page_cycle();
+    test_page_priority_and_keys();
+    test_reset_text();
+    test_usage_alert();
     test_speed_levels();
     test_waiting_overrides_speed();
     test_link_timeout_per_source();

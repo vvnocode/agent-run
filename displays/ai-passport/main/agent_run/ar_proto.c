@@ -124,6 +124,115 @@ ar_line_kind_t ar_proto_parse_line(const char *line, ar_state_t *out) {
     return AR_LINE_STATE;
 }
 
+// A 帧的必填字段
+enum {
+    A_T = 1 << 0,
+    A_WN = 1 << 1,
+    A_BG = 1 << 2,
+    A_DONE = 1 << 3,
+    A_H = 1 << 4,
+    A_HR = 1 << 5,
+    A_W = 1 << 6,
+    A_WR = 1 << 7,
+    A_ALL = (1 << 8) - 1,
+};
+
+// 用量字段:"-" 暂无数据,"x" 无此限额,否则为 0–100 的百分比
+static bool parse_usage(const char *start, const char *end, uint8_t *out) {
+    if (end - start == 1 && *start == '-') {
+        *out = AR_USAGE_UNKNOWN;
+        return true;
+    }
+    if (end - start == 1 && *start == 'x') {
+        *out = AR_USAGE_NO_LIMIT;
+        return true;
+    }
+    uint32_t n = 0;
+    if (!parse_uint(start, end, 100, &n)) return false;
+    *out = (uint8_t)n;
+    return true;
+}
+
+// 距重置分钟数:"-" 未知,否则为 0–AR_RESET_MAX_MIN
+static bool parse_minutes(const char *start, const char *end, uint16_t *out) {
+    if (end - start == 1 && *start == '-') {
+        *out = AR_RESET_UNKNOWN;
+        return true;
+    }
+    uint32_t n = 0;
+    if (!parse_uint(start, end, AR_RESET_MAX_MIN, &n)) return false;
+    *out = (uint16_t)n;
+    return true;
+}
+
+// 解析 A 帧的一个 key=value 记号,成功时在 seen 中置位。未知键视为成功(忽略)。
+static bool parse_agent_field(const char *start, const char *end, ar_agent_t *a, uint32_t *seen) {
+    const char *eq = memchr(start, '=', (size_t)(end - start));
+    if (!eq) return false;
+    size_t key_len = (size_t)(eq - start);
+    const char *v = eq + 1;
+    uint32_t n = 0;
+
+#define KEY_IS(lit) (key_len == sizeof(lit) - 1 && memcmp(start, lit, key_len) == 0)
+    if (KEY_IS("t")) {
+        // 只接受有专用页面的工具;dsh 等以后加页面时再放开
+        if (end - v != 2) return false;
+        if (v[0] == 'C' && v[1] == 'C') a->tool = AR_TOOL_CC;
+        else if (v[0] == 'C' && v[1] == 'X') a->tool = AR_TOOL_CX;
+        else return false;
+        *seen |= A_T;
+    } else if (KEY_IS("wn")) {
+        if (!parse_uint(v, end, 99, &n)) return false;
+        a->wn = (uint8_t)n;
+        *seen |= A_WN;
+    } else if (KEY_IS("bg")) {
+        if (!parse_uint(v, end, 99, &n)) return false;
+        a->bg = (uint8_t)n;
+        *seen |= A_BG;
+    } else if (KEY_IS("done")) {
+        if (!parse_uint(v, end, 999, &n)) return false;
+        a->done = (uint16_t)n;
+        *seen |= A_DONE;
+    } else if (KEY_IS("h")) {
+        if (!parse_usage(v, end, &a->h)) return false;
+        *seen |= A_H;
+    } else if (KEY_IS("hr")) {
+        if (!parse_minutes(v, end, &a->hr)) return false;
+        *seen |= A_HR;
+    } else if (KEY_IS("w")) {
+        if (!parse_usage(v, end, &a->w)) return false;
+        *seen |= A_W;
+    } else if (KEY_IS("wr")) {
+        if (!parse_minutes(v, end, &a->wr)) return false;
+        *seen |= A_WR;
+    }
+#undef KEY_IS
+    return true;
+}
+
+bool ar_proto_parse_agent(const char *line, ar_agent_t *out) {
+    if (!line || strncmp(line, "AR1 A ", 6) != 0) return false;
+    size_t len = strlen(line);
+    if (len > AR_PROTO_MAX_LINE) return false;
+
+    const char *p = line + 6;
+    const char *end = line + len;
+    // 与状态帧相同:先解析到临时结构,全部合法后再写回
+    ar_agent_t a;
+    memset(&a, 0, sizeof(a));
+    uint32_t seen = 0;
+    while (p < end) {
+        const char *tok_end = memchr(p, ' ', (size_t)(end - p));
+        if (!tok_end) tok_end = end;
+        if (tok_end == p) return false;   // 连续空格
+        if (!parse_agent_field(p, tok_end, &a, &seen)) return false;
+        p = tok_end < end ? tok_end + 1 : end;
+    }
+    if (seen != A_ALL) return false;
+    *out = a;
+    return true;
+}
+
 void ar_line_init(ar_line_buf_t *lb) {
     lb->len = 0;
     lb->overflow = false;

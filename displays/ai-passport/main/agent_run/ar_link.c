@@ -53,13 +53,22 @@ void ar_link_publish(const ar_state_t *st, ar_source_t src) {
     xSemaphoreGive(s_lock);
 }
 
-// 处理一整行:状态帧写入快照,PING 回复 HELLO,截屏命令交给主循环,其他行忽略
+void ar_link_publish_agent(const ar_agent_t *agent) {
+    if (agent->tool >= AR_AGENT_TOOLS) return;   // 解析时已限定为 CC / CX,这里再防一次越界
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_snap.agent[agent->tool] = *agent;
+    s_snap.has_agent[agent->tool] = true;
+    xSemaphoreGive(s_lock);
+}
+
+// 处理一整行:状态帧与 A 帧写入快照,PING 回复 HELLO,截屏命令交给主循环,其他行忽略
 static void handle_line(const char *line) {
     if (strcmp(line, "FAP_SCREENSHOT_V1") == 0) {
         ar_capture_request();   // 截屏要持有 LVGL 锁并整屏刷新,放到主循环里做
         return;
     }
     ar_state_t st;
+    ar_agent_t agent;
     switch (ar_proto_parse_line(line, &st)) {
     case AR_LINE_STATE:
         ar_link_publish(&st, AR_SRC_USB);
@@ -68,6 +77,7 @@ static void handle_line(const char *line) {
         send_hello();
         break;
     default:
+        if (ar_proto_parse_agent(line, &agent)) ar_link_publish_agent(&agent);
         break;
     }
 }

@@ -2,6 +2,7 @@
 //
 // 协议见 docs/specs/2026-11-08-agent-run-design.md §6(外层仓库)。主机每行发送:
 //   AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q
+//   AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110      工具专用页面,见 -agent-pages-design.md §5.2
 //   AR1 PING
 // 本模块只做“字节 → 行 → 结构体”,不依赖 ESP-IDF / LVGL。
 #pragma once
@@ -34,6 +35,29 @@ typedef struct {
     uint8_t reason;   // ar_reason_t
 } ar_wait_item_t;
 
+// 有专用页面的工具数:Claude Code 与 Codex,下标即 ar_tool_t(AR_TOOL_CC、AR_TOOL_CX)
+#define AR_AGENT_TOOLS 2
+
+// A 帧里用量字段的两个特殊值:"-" 暂无数据,"x" 账户没有这一限额窗口
+#define AR_USAGE_UNKNOWN 255u
+#define AR_USAGE_NO_LIMIT 254u
+
+// A 帧里距重置分钟数:"-" 为未知;数值上限为两周
+#define AR_RESET_UNKNOWN 0xFFFFu
+#define AR_RESET_MAX_MIN 20160u
+
+// 一个工具专用页面的数据(A 帧)
+typedef struct {
+    uint8_t tool;     // AR_TOOL_CC 或 AR_TOOL_CX
+    uint8_t wn;       // 等你处理
+    uint8_t bg;       // 后台运行
+    uint16_t done;    // 今日完成
+    uint8_t h;        // 5 小时窗口已用百分比 0–100,或 AR_USAGE_UNKNOWN / AR_USAGE_NO_LIMIT
+    uint16_t hr;      // 5 小时窗口距重置分钟数,或 AR_RESET_UNKNOWN
+    uint8_t w;        // 每周窗口已用百分比,取值同 h
+    uint16_t wr;      // 每周窗口距重置分钟数,取值同 hr
+} ar_agent_t;
+
 // 一帧完整状态
 typedef struct {
     uint16_t seq;
@@ -56,6 +80,11 @@ typedef enum {
 // 解析一行(不含行尾)。只有返回 AR_LINE_STATE 时才写 out;任何字段缺失或越界都整帧丢弃,
 // 未知键忽略(便于主机端向后兼容地加字段)。
 ar_line_kind_t ar_proto_parse_line(const char *line, ar_state_t *out);
+
+// 解析一行 A 帧(不含行尾)。合法时写 out 并返回 true;不是 A 帧、工具代号不是 CC / CX、
+// 任何字段缺失或越界都返回 false 且不写 out。未知键忽略。ar_proto_parse_line() 不认 A 帧,
+// 调用方在它返回 AR_LINE_IGNORED 后再试本函数。
+bool ar_proto_parse_agent(const char *line, ar_agent_t *out);
 
 // 行装配器:逐字节喂入串口数据,遇到 \r 或 \n 时产出一行。
 typedef struct {

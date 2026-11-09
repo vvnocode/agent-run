@@ -1,6 +1,10 @@
 // main/agent_run/ar_model.c —— 画面选择与交互规则实现。见 ar_model.h。
 #include "ar_model.h"
 
+#include <stdio.h>
+
+#include "ar_text.h"
+
 // 亮度档位对应的背光百分比
 static const uint8_t BRIGHTNESS_PERCENT[AR_BRIGHTNESS_LEVELS] = { 20, 40, 60, 80, 100 };
 
@@ -47,6 +51,44 @@ uint8_t ar_model_speed_bars(ar_screen_t screen) {
     case AR_SCREEN_DASH: return 4;
     default: return 0;
     }
+}
+
+uint8_t ar_page_step(uint8_t page, int delta) {
+    if (page >= AR_PAGE_COUNT) page = AR_PAGE_HOME;
+    // 先把 delta 归到 [0, AR_PAGE_COUNT),负数也能正确循环
+    int step = delta % (int)AR_PAGE_COUNT;
+    if (step < 0) step += (int)AR_PAGE_COUNT;
+    return (uint8_t)((page + step) % AR_PAGE_COUNT);
+}
+
+uint8_t ar_page_shown(uint8_t page, ar_screen_t screen) {
+    if (page >= AR_PAGE_COUNT) return AR_PAGE_HOME;
+    // 提醒优先:等你处理、未连接时显示首页的对应画面,清空后自然回到用户所在页面
+    if (screen == AR_SCREEN_WAITING || screen == AR_SCREEN_DISCONNECTED) return AR_PAGE_HOME;
+    return page;
+}
+
+bool ar_page_keys_active(ar_screen_t screen, bool menu_open, bool pairing) {
+    if (menu_open || pairing) return false;
+    return screen != AR_SCREEN_WAITING && screen != AR_SCREEN_DISCONNECTED;
+}
+
+void ar_reset_text(uint16_t minutes, char *buf, size_t size) {
+    if (size == 0) return;
+    if (minutes == AR_RESET_UNKNOWN) {
+        snprintf(buf, size, "%s", AR_TXT_RESET_UNKNOWN);
+        return;
+    }
+    if (minutes == 0) minutes = 1;   // 主机向上取整,不会发 0;防御性地按 1 分钟显示
+    const unsigned m = minutes;
+    if (m < 60u) snprintf(buf, size, AR_TXT_RESET_MIN_FMT, m);
+    else if (m < 24u * 60u) snprintf(buf, size, AR_TXT_RESET_HOUR_FMT, m / 60u, m % 60u);
+    else snprintf(buf, size, AR_TXT_RESET_DAY_FMT, m / (24u * 60u), m % (24u * 60u) / 60u);
+}
+
+bool ar_usage_alert(uint8_t percent) {
+    // AR_USAGE_UNKNOWN、AR_USAGE_NO_LIMIT 数值上大于 100,必须先排除
+    return percent <= 100u && percent >= AR_USAGE_ALERT_PERCENT;
 }
 
 void ar_notice_init(ar_notice_t *n) {

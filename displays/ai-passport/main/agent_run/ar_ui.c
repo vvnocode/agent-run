@@ -1,6 +1,7 @@
 // main/agent_run/ar_ui.c —— Agent Run! 界面实现。
 //
 // 布局:标题栏、计数区、宠物场景、三格计数、底栏(普通画面);
+//       标题栏、工具名与页码点、两张用量卡片、三格计数、底栏(工具专用页面);
 //       标题栏、橙色提醒条、宠物场景、等待列表、底栏(等你处理);
 //       标题栏、未连接提示、变暗的宠物场景(未连接)。
 // 设置菜单打开时,标题栏以下换成一块面板:一级菜单列出音量、亮度两行,二级显示放大的
@@ -54,6 +55,26 @@ LV_FONT_DECLARE(ar_font_cjk14);
 #define TILE_CANVAS_H 44
 #define ALERT_NUM_W 48
 #define ALERT_NUM_H 28
+
+// 工具专用页面(专用页面方案 §4.2)。卡片内元素的坐标以卡片左上角为原点
+#define AGENT_TITLE_Y 38
+#define PAGE_DOT 6
+#define PAGE_DOT_GAP 6
+#define CARD_Y0 60               // 5 小时用量卡片
+#define CARD_Y1 132              // 每周用量卡片
+#define CARD_H 64
+#define CARD_PAD 12
+#define CARD_TITLE_Y 6
+#define PCT_SCALE 3
+#define PCT_W BIG_W              // 百分比画在首页大数字缓冲的上下两半里,见 create_agent_page()
+#define PCT_H (BIG_H / 2)
+#define PCT_Y 5
+#define USAGE_BAR_W 180
+#define USAGE_BAR_H 8
+#define USAGE_BAR_Y 31
+#define CARD_RESET_Y 43
+#define TILE_Y_AGENT 208         // 专用页面上计数格上移,给两张卡片让出间距
+#define TILE_LABEL_Y 30
 
 // 设置菜单面板:盖住标题栏以下的区域,标题栏的电量与音量图标保持可见。
 // 以下除 MENU_Y 外都是面板内坐标
@@ -134,8 +155,21 @@ static lv_obj_t *s_speed_label;
 static lv_obj_t *s_bars[4];
 static lv_obj_t *s_tiles[3];
 static lv_obj_t *s_tile_canvas[3];
+static lv_obj_t *s_tile_label[3];   // 计数格的中文标签,只在专用页面显示
 static lv_obj_t *s_done_label;
 static lv_obj_t *s_wait_short_label;
+// 工具专用页面:工具名、页码点与两张用量卡片放在同一分组里整组显隐
+typedef struct {
+    lv_obj_t *box;
+    lv_obj_t *pct;        // 百分比像素字
+    lv_obj_t *fill;       // 进度条的已用部分,画在轨道之上
+    lv_obj_t *reset;      // 距重置时间或缺数据的原因
+    lv_draw_buf_t buf;    // 指向首页大数字缓冲的一半
+} usage_card_t;
+static lv_obj_t *s_agent;
+static lv_obj_t *s_agent_title;
+static lv_obj_t *s_page_dots[AR_PAGE_COUNT];
+static usage_card_t s_cards[2];
 // 场景
 static lv_obj_t *s_scene;
 // 等你处理
@@ -356,6 +390,18 @@ static void draw_tile(int index, unsigned value) {
     lv_obj_invalidate(s_tile_canvas[index]);
 }
 
+// 专用页面的计数格:只画数字(上限 999),标签由中文标签对象显示;为 0 时用暗色
+static void draw_agent_tile(int index, unsigned value, uint32_t color) {
+    static lv_draw_buf_t *const bufs[3] = { &s_tile0_buf, &s_tile1_buf, &s_tile2_buf };
+    char text[4];
+    if (value > 999) value = 999;
+    snprintf(text, sizeof(text), "%u", value);
+    ar_canvas_t c = canvas_of(bufs[index]);
+    ar_raster_fill(&c, AR_RGB565(C_TILE));
+    text_centered(&c, 2, text, 3, AR_RGB565(value ? color : C_DIM));
+    lv_obj_invalidate(s_tile_canvas[index]);
+}
+
 // 提醒条里的数字
 static int draw_alert_number(unsigned value) {
     char text[4];
@@ -571,6 +617,45 @@ static lv_obj_t *make_group(lv_obj_t *parent) {
     return o;
 }
 
+// 工具专用页面:工具名、页码点、两张用量卡片(标题、百分比、进度条、距重置时间),
+// 以及首页计数格里的中文标签。在设置菜单之前创建,菜单面板叠在它上面
+static void create_agent_page(void) {
+    static const char *const tile_names[3] = { AR_TXT_TILE_WORKING, AR_TXT_TILE_WAITING, AR_TXT_DONE_TODAY };
+    s_agent = make_group(s_scr);
+    s_agent_title = make_label(s_agent, C_TEXT, PAD_X, AGENT_TITLE_Y);
+    // 页码点靠右,三点依次为首页、Claude Code、Codex
+    for (int i = 0; i < AR_PAGE_COUNT; i++) {
+        const int x = PAD_X + CONTENT_W - (AR_PAGE_COUNT - i) * (PAGE_DOT + PAGE_DOT_GAP) + PAGE_DOT_GAP;
+        s_page_dots[i] = make_box(s_agent, C_TRACK, x, AGENT_TITLE_Y + 5, PAGE_DOT, PAGE_DOT, PAGE_DOT / 2);
+    }
+
+    // 两张卡片的百分比画在首页大数字缓冲的上下两半:专用页面显示时首页大数字是隐藏的,
+    // 回到首页时 ar_ui_update 会重画大数字,因此不必另占约 6 KB 内存
+    const uint32_t stride = s_big_buf.header.stride;
+    for (int i = 0; i < 2; i++) {
+        usage_card_t *c = &s_cards[i];
+        lv_draw_buf_init(&c->buf, PCT_W, PCT_H, LV_COLOR_FORMAT_RGB565, stride,
+                         s_big_buf.data + (size_t)i * PCT_H * stride, PCT_H * stride);
+        lv_draw_buf_set_flag(&c->buf, LV_IMAGE_FLAGS_MODIFIABLE);
+        c->box = make_box(s_agent, C_TILE, PAD_X, i == 0 ? CARD_Y0 : CARD_Y1, CONTENT_W, CARD_H, 10);
+        lv_obj_t *title = make_label(c->box, C_TEXT2, CARD_PAD, CARD_TITLE_Y);
+        lv_label_set_text(title, i == 0 ? AR_TXT_USAGE_FIVE_HOUR : AR_TXT_USAGE_WEEK);
+        c->pct = make_canvas(c->box, &c->buf, CONTENT_W - CARD_PAD - PCT_W, PCT_Y);
+        make_box(c->box, C_TRACK, CARD_PAD, USAGE_BAR_Y, USAGE_BAR_W, USAGE_BAR_H, USAGE_BAR_H / 2);
+        c->fill = make_box(c->box, C_ACCENT, CARD_PAD, USAGE_BAR_Y, USAGE_BAR_H, USAGE_BAR_H, USAGE_BAR_H / 2);
+        c->reset = make_label(c->box, C_TEXT2, CARD_PAD, CARD_RESET_Y);
+    }
+    show(s_agent, false);
+
+    // 计数格标签:放进首页的计数格,创建在格内画布之后,叠在画布上方
+    for (int i = 0; i < 3; i++) {
+        s_tile_label[i] = make_label(s_tiles[i], C_TEXT2, 0, 0);
+        lv_label_set_text(s_tile_label[i], tile_names[i]);
+        lv_obj_align(s_tile_label[i], LV_ALIGN_TOP_MID, 0, TILE_LABEL_Y);
+        show(s_tile_label[i], false);
+    }
+}
+
 // 设置菜单面板:深色面板加一圈细边框,与现有卡片同一风格;最后创建,叠在其他元素之上。
 // 行内元素都直接放在分组里,不再套一层行容器,控制对象嵌套深度(截屏渲染在主任务栈上)
 static void create_menu(void) {
@@ -711,6 +796,7 @@ void ar_ui_create(void) {
     s_pair_hint = make_label(s_scr, C_TEXT2, PAD_X, 222);
     lv_label_set_text(s_pair_hint, AR_TXT_PAIR_HINT);
 
+    create_agent_page();
     create_menu();
 
     s_has_last = false;
@@ -816,9 +902,65 @@ static void update_menu(const ar_view_t *v, bool open) {
     align_center(s_menu_hint, MENU_HINT_Y);
 }
 
+// 一张用量卡片:百分比、进度条(≥80% 用警示色)、距重置时间。percent 为 0–100,
+// 或 AR_USAGE_UNKNOWN(暂无数据)、AR_USAGE_NO_LIMIT(无此限额),这两种情况显示 -- 与原因
+static void update_card(usage_card_t *c, uint8_t percent, uint16_t minutes) {
+    const bool known = percent <= 100u;
+    const bool alert = ar_usage_alert(percent);
+    char text[5];
+    if (known) snprintf(text, sizeof(text), "%u%%", (unsigned)percent);
+    else snprintf(text, sizeof(text), "--");
+    ar_canvas_t cv = canvas_of(&c->buf);
+    ar_raster_fill(&cv, AR_RGB565(C_TILE));
+    const uint32_t ink = !known ? C_DIM : alert ? C_ALERT : C_TEXT;
+    ar_raster_text(&cv, cv.w - ar_raster_text_width(text, PCT_SCALE), 0, text, PCT_SCALE, AR_RGB565(ink));
+    lv_obj_invalidate(c->pct);
+
+    // 已用部分至少画成一个圆点,1% 也看得见
+    int w = known ? USAGE_BAR_W * percent / 100 : 0;
+    show(c->fill, w > 0);
+    if (w > 0) {
+        if (w < USAGE_BAR_H) w = USAGE_BAR_H;
+        lv_obj_set_width(c->fill, w);
+        lv_obj_set_style_bg_color(c->fill, lv_color_hex(alert ? C_ALERT : C_ACCENT), LV_PART_MAIN);
+    }
+
+    char reset[40];
+    if (percent == AR_USAGE_NO_LIMIT) snprintf(reset, sizeof(reset), "%s", AR_TXT_USAGE_NO_LIMIT);
+    else if (!known) snprintf(reset, sizeof(reset), "%s", AR_TXT_USAGE_NO_DATA);
+    else ar_reset_text(minutes, reset, sizeof(reset));
+    lv_obj_set_style_text_color(c->reset, lv_color_hex(known ? C_TEXT2 : C_DIM), LV_PART_MAIN);
+    lv_label_set_text(c->reset, reset);
+}
+
+// 工具专用页面:工具名、页码点、两张用量卡片,三格为工作中、等你处理、今日完成,底栏为后台运行
+static void update_agent_page(const ar_view_t *v) {
+    const bool cc = v->page == AR_PAGE_CC;
+    const ar_agent_t *a = &v->agent;
+    lv_label_set_text(s_agent_title, cc ? AR_TXT_TOOL_CC : AR_TXT_TOOL_CX);
+    for (int i = 0; i < AR_PAGE_COUNT; i++) {
+        lv_obj_set_style_bg_color(s_page_dots[i], lv_color_hex(i == v->page ? C_ACCENT : C_TRACK), LV_PART_MAIN);
+    }
+    // 还没收到该工具的 A 帧(主机端是旧版本等)时,用量按暂无数据显示,计数按 0
+    update_card(&s_cards[0], v->has_agent ? a->h : AR_USAGE_UNKNOWN, a->hr);
+    update_card(&s_cards[1], v->has_agent ? a->w : AR_USAGE_UNKNOWN, a->wr);
+
+    // 工作中沿用状态帧的 cc / cx(含后台运行);刚有会话完成时“今日完成”用强调色
+    draw_agent_tile(0, cc ? v->state.cc : v->state.cx, C_TEXT);
+    draw_agent_tile(1, v->has_agent ? a->wn : 0, C_ALERT);
+    draw_agent_tile(2, v->has_agent ? a->done : 0, v->agent_flash ? C_ACCENT : C_TEXT);
+    lv_obj_set_style_text_color(s_tile_label[2], lv_color_hex(v->agent_flash ? C_ACCENT : C_TEXT2), LV_PART_MAIN);
+
+    lv_obj_set_style_text_color(s_done_label, lv_color_hex(C_TEXT2), LV_PART_MAIN);
+    lv_label_set_text_fmt(s_done_label, AR_TXT_BACKGROUND_FMT, (unsigned)(v->has_agent ? a->bg : 0));
+    lv_label_set_text(s_wait_short_label, AR_TXT_PAGE_HINT);
+    align_right(s_wait_short_label, PAD_X + CONTENT_W - 6, 276);
+}
+
 void ar_ui_update(const ar_view_t *v) {
     if (s_has_last && memcmp(v, &s_last_view, sizeof(*v)) == 0) return;
     const bool screen_changed = !s_has_last || v->screen != s_last_view.screen;
+    const bool page_changed = !s_has_last || v->page != s_last_view.page;
     s_last_view = *v;
     s_has_last = true;
 
@@ -827,6 +969,8 @@ void ar_ui_update(const ar_view_t *v) {
     const bool waiting = !pairing && v->screen == AR_SCREEN_WAITING;
     const bool disconnected = !pairing && v->screen == AR_SCREEN_DISCONNECTED;
     const bool normal = !pairing && !waiting && !disconnected;
+    // 专用页面只在普通画面下出现;等你处理、未连接时调用方已把 page 换算成首页
+    const bool agent_page = normal && v->page != AR_PAGE_HOME;
     // 设置菜单打开时只保留标题栏,画面内容整体隐藏,被面板盖住的动画也不再重绘;
     // 配对确认时不显示菜单
     const bool menu = !pairing && v->menu_level != AR_MENU_CLOSED;
@@ -834,23 +978,29 @@ void ar_ui_update(const ar_view_t *v) {
     draw_header(v);
 
     // 各组元素的显隐
-    const bool show_normal = normal && !menu;
+    const bool show_normal = normal && !agent_page && !menu;
+    const bool show_agent = agent_page && !menu;
     const bool show_waiting = waiting && !menu;
     const bool show_disconnected = disconnected && !menu;
     show(s_big, show_normal);
     show(s_unit_label, show_normal);
     show(s_speed_label, show_normal);
     for (int i = 0; i < 4; i++) show(s_bars[i], show_normal);
-    for (int i = 0; i < 3; i++) show(s_tiles[i], show_normal);
-    show(s_done_label, show_normal);
-    show(s_wait_short_label, show_normal);
+    for (int i = 0; i < 3; i++) {
+        show(s_tiles[i], show_normal || show_agent);
+        show(s_tile_label[i], show_agent);
+        lv_obj_set_y(s_tiles[i], agent_page ? TILE_Y_AGENT : TILE_Y);
+    }
+    show(s_agent, show_agent);
+    show(s_done_label, show_normal || show_agent);
+    show(s_wait_short_label, show_normal || show_agent);
     show(s_alert, show_waiting);
     show(s_list, show_waiting);
     show(s_others_label, show_waiting);
     show(s_hint_label, show_waiting);
     show(s_disc_hint, show_disconnected);
     show(s_state_label, show_normal || show_disconnected);
-    show(s_scene, !menu);
+    show(s_scene, !menu && !agent_page);
     show(s_pair_title, pairing);
     show(s_pair_name, pairing);
     show(s_pair_hint, pairing);
@@ -865,6 +1015,8 @@ void ar_ui_update(const ar_view_t *v) {
         if (v->pair_cleared) lv_label_set_text(s_disc_hint, AR_TXT_PAIR_CLEARED);
         else if (!v->ble_bonded) lv_label_set_text_fmt(s_disc_hint, AR_TXT_PAIR_READY_FMT, v->ble_name);
         else lv_label_set_text(s_disc_hint, AR_TXT_DISCONNECTED_HINT);
+    } else if (agent_page) {
+        update_agent_page(v);
     } else if (normal) {
         const ar_state_t *s = &v->state;
         unsigned total = ar_model_working_total(s);
@@ -916,8 +1068,9 @@ void ar_ui_update(const ar_view_t *v) {
         align_right(s_hint_label, PAD_X + CONTENT_W - 6, 270);
     }
 
-    // 画面切换时立刻重画一次场景,不等下一个动画帧;配对时宠物用招手姿势
-    if (screen_changed || pairing != s_last_pairing) {
+    // 画面或页面切换时立刻重画一次场景,不等下一个动画帧(专用页面期间不画场景);
+    // 配对时宠物用招手姿势
+    if (screen_changed || page_changed || pairing != s_last_pairing) {
         ar_ui_animate(pairing ? AR_SCREEN_WAITING : v->screen, 0);
     }
     s_last_pairing = pairing;
