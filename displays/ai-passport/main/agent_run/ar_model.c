@@ -166,6 +166,52 @@ void ar_menu_tick(ar_menu_t *m, uint32_t ms_since_key) {
     }
 }
 
+void ar_keywake_init(ar_keywake_t *k) {
+    k->swallow = false;
+    k->has_release = false;
+    k->last_release_ms = 0;
+}
+
+void ar_keywake_press(ar_keywake_t *k, bool dark, uint32_t now_ms) {
+    if (dark) {
+        // 熄屏时按下:开始一次亮屏手势,其后的动作都属于它
+        k->swallow = true;
+        return;
+    }
+    // 屏幕亮着时按下:离上次松手已超过连击窗口,说明上一手势已经结束。上一手势若没有
+    // 产生动作(三连击等),吞键状态会遗留到这里,清掉它,免得误吞这一次的动作
+    if (k->swallow && k->has_release && (uint32_t)(now_ms - k->last_release_ms) >= AR_KEY_GESTURE_GAP_MS) {
+        k->swallow = false;
+    }
+}
+
+void ar_keywake_release(ar_keywake_t *k, uint32_t now_ms) {
+    k->has_release = true;
+    k->last_release_ms = now_ms;
+}
+
+bool ar_keywake_action(ar_keywake_t *k) {
+    // 每次手势最多产生一个动作(单击、双击或长按),吞掉一个即结束这次亮屏手势
+    if (k->swallow) {
+        k->swallow = false;
+        return false;
+    }
+    return true;
+}
+
+void ar_power_init(ar_power_t *p) {
+    p->known = false;
+    p->on_usb = false;
+}
+
+bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on) {
+    const bool unplugged = p->known && p->on_usb && !on_usb;
+    p->known = true;
+    p->on_usb = on_usb;
+    // 只在“拔线时屏幕亮着”这一种情况补记亮屏事件,让屏幕按电池规则继续亮一段时间
+    return unplugged && screen_on;
+}
+
 uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in) {
     const uint8_t normal = ar_brightness_percent(in->level);
     const uint8_t dim = normal < AR_DIM_PERCENT ? normal : AR_DIM_PERCENT;   // 只降不升
@@ -182,6 +228,8 @@ uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in) {
 bool ar_model_should_deep_sleep(const ar_sleep_in_t *in) {
     // 有 USB 主机、可能没装电池、正在配对时一律不睡
     if (in->on_usb_power || !in->battery_present || in->confirming) return false;
+    // 熄屏满 1 小时即关机,在线时也一样(亮屏期间 ms_dark 为 0)
+    if (in->ms_dark >= AR_POWER_OFF_AFTER_DARK_MS) return true;
     // 在线时 ms_disconnected 为 0,自然不满足
     return in->ms_disconnected >= AR_DEEP_SLEEP_AFTER_MS && in->ms_since_key >= AR_DEEP_SLEEP_AFTER_MS;
 }

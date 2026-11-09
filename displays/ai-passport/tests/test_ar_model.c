@@ -209,6 +209,79 @@ static void test_backlight_off_when_disconnected(void) {
     assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
 }
 
+static void test_unplug_keeps_screen_on(void) {
+    // 复现:插着 USB 时有会话完成点亮屏幕,1 分钟后拔掉 USB。按电池规则这时已超过 30 秒,
+    // 若不把拔线算作亮屏事件,屏幕会在拔线瞬间熄灭
+    ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, true);
+    in.ms_since_wake = 60000;
+    assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
+    in.on_usb_power = false;
+    assert(ar_model_backlight_percent(&in) == 0);
+
+    ar_power_t p;
+    ar_power_init(&p);
+    assert(!ar_power_update(&p, true, true));   // 开机第一次只记基准
+    assert(!ar_power_update(&p, true, true));   // 供电方式没变
+    // 拔线时屏幕亮着:记一次亮屏事件,按电池规则继续亮
+    assert(ar_power_update(&p, false, true));
+    in.ms_since_wake = 0;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    assert(!ar_power_update(&p, false, true));
+
+    // 屏幕已熄灭时拔线(或 Mac 睡眠导致 USB 主机离线)不点亮
+    ar_power_init(&p);
+    ar_power_update(&p, true, false);
+    assert(!ar_power_update(&p, false, false));
+    // 插上 USB 不在这里点亮:连上电脑另有亮屏事件
+    assert(!ar_power_update(&p, true, false));
+    assert(!ar_power_update(&p, true, true));
+}
+
+static void test_any_key_wakes_dark_screen(void) {
+    ar_keywake_t k;
+    ar_keywake_init(&k);
+
+    // 屏幕亮着:按键动作照常交给菜单
+    ar_keywake_press(&k, false, 1000);
+    ar_keywake_release(&k, 1100);
+    assert(ar_keywake_action(&k));
+
+    // 熄屏时单击:按下即亮屏(调用方处理),这一下的单击被吞掉,下一次单击照常
+    ar_keywake_press(&k, true, 2000);
+    ar_keywake_release(&k, 2100);
+    assert(!ar_keywake_action(&k));
+    ar_keywake_press(&k, false, 3000);
+    ar_keywake_release(&k, 3100);
+    assert(ar_keywake_action(&k));
+
+    // 熄屏时双击:第二下按下时屏幕已亮,但仍属同一手势,双击整体被吞掉
+    ar_keywake_press(&k, true, 4000);
+    ar_keywake_release(&k, 4080);
+    ar_keywake_press(&k, false, 4150);
+    ar_keywake_release(&k, 4230);
+    assert(!ar_keywake_action(&k));
+
+    // 熄屏时长按(如按住上键):长按动作被吞掉
+    ar_keywake_press(&k, true, 5000);
+    assert(!ar_keywake_action(&k));
+    ar_keywake_release(&k, 6000);
+
+    // 熄屏时三连击:按键组件不发单击、双击事件,手势结束时没有动作可吞。
+    // 下一次手势与上次松手隔开超过 AR_KEY_GESTURE_GAP_MS,其动作不能被误吞
+    ar_keywake_press(&k, true, 7000);
+    ar_keywake_release(&k, 7060);
+    ar_keywake_press(&k, false, 7120);
+    ar_keywake_release(&k, 7180);
+    ar_keywake_press(&k, false, 7240);
+    ar_keywake_release(&k, 7300);
+    ar_keywake_press(&k, false, 7300 + AR_KEY_GESTURE_GAP_MS);
+    ar_keywake_release(&k, 7400 + AR_KEY_GESTURE_GAP_MS);
+    assert(ar_keywake_action(&k));
+
+    // 连击判定窗口(按键组件为 180 ms)必须落在手势间隔之内
+    assert(AR_KEY_GESTURE_GAP_MS > 180u);
+}
+
 static void test_notice_events(void) {
     ar_notice_t n;
     ar_notice_init(&n);
@@ -323,6 +396,42 @@ static void test_deep_sleep_after_long_disconnect_on_battery(void) {
     assert(!ar_model_should_deep_sleep(&in));
 }
 
+// 熄屏关机判定的默认输入:电池供电、在线、刚按过键,只有熄屏时长满 1 小时
+static ar_sleep_in_t dark_in(void) {
+    ar_sleep_in_t in = {
+        .on_usb_power = false,
+        .battery_present = true,
+        .confirming = false,
+        .ms_disconnected = 0,
+        .ms_since_key = 0,
+        .ms_dark = AR_POWER_OFF_AFTER_DARK_MS,
+    };
+    return in;
+}
+
+static void test_power_off_after_dark_hour_on_battery(void) {
+    assert(AR_POWER_OFF_AFTER_DARK_MS == 3600000u);
+    // 电池供电时熄屏满 1 小时即关机,在线(含蓝牙连着电脑)也一样
+    ar_sleep_in_t in = dark_in();
+    assert(ar_model_should_deep_sleep(&in));
+    in.ms_dark = AR_POWER_OFF_AFTER_DARK_MS - 1;
+    assert(!ar_model_should_deep_sleep(&in));
+    // 亮屏期间熄屏时长为 0,不关机
+    in.ms_dark = 0;
+    assert(!ar_model_should_deep_sleep(&in));
+
+    // 插着 USB 主机、读不到电量计、等待配对确认时都不关机
+    in = dark_in();
+    in.on_usb_power = true;
+    assert(!ar_model_should_deep_sleep(&in));
+    in = dark_in();
+    in.battery_present = false;
+    assert(!ar_model_should_deep_sleep(&in));
+    in = dark_in();
+    in.confirming = true;
+    assert(!ar_model_should_deep_sleep(&in));
+}
+
 static void test_no_deep_sleep_when_powered_or_pairing(void) {
     // 接着 USB 主机时不睡
     ar_sleep_in_t in = sleep_in();
@@ -349,10 +458,13 @@ int main(void) {
     test_backlight_on_usb_power();
     test_backlight_on_battery();
     test_backlight_off_when_disconnected();
+    test_unplug_keeps_screen_on();
+    test_any_key_wakes_dark_screen();
     test_notice_events();
     test_chime_rules();
     test_volume();
     test_deep_sleep_after_long_disconnect_on_battery();
+    test_power_off_after_dark_hour_on_battery();
     test_no_deep_sleep_when_powered_or_pairing();
     return 0;
 }

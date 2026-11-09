@@ -42,6 +42,13 @@
 // 电池供电时,“未连接”且无按键持续这么久就进入深睡(晚于关背光)
 #define AR_DEEP_SLEEP_AFTER_MS 1800000u
 
+// 电池供电时,屏幕持续熄灭这么久就关机(进入深睡),在线时也一样
+#define AR_POWER_OFF_AFTER_DARK_MS 3600000u
+
+// 同一次按键手势的松手与下一次按下的最大间隔:按键组件的连击判定窗口为 180 ms
+// (见 bsp_pins.h 的 BSP_BTN_SHORT_PRESS_MS),再留出轮询与防抖的余量
+#define AR_KEY_GESTURE_GAP_MS 250u
+
 // 亮度档位
 #define AR_BRIGHTNESS_LEVELS 5
 #define AR_BRIGHTNESS_DEFAULT 3
@@ -179,6 +186,43 @@ typedef struct {
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
 } ar_backlight_in_t;
 
+// 熄屏时按键亮屏。按键组件只在单击、双击、长按时发出动作事件,三连击、双击第二下按住
+// 超过 180 ms 等手势不发任何动作事件,所以亮屏以“按下”为准;亮屏的那次手势随后产生的
+// 动作要吞掉,不执行菜单等功能。
+typedef struct {
+    bool swallow;               // 正在吞掉亮屏那次手势的动作
+    bool has_release;           // 是否记录过松手
+    uint32_t last_release_ms;   // 最近一次松手的时刻
+} ar_keywake_t;
+
+void ar_keywake_init(ar_keywake_t *k);
+
+// 任意键按下时调用;是否亮屏由调用方处理(任何按下都算亮屏事件)。dark 为 true 表示按下时
+// 屏幕熄灭,这次手势的动作将被吞掉。与上次松手相隔不少于 AR_KEY_GESTURE_GAP_MS 时视为新手势,
+// 上一手势没有产生动作(如三连击)时留下的吞键状态随之清除。now_ms 允许回绕
+void ar_keywake_press(ar_keywake_t *k, bool dark, uint32_t now_ms);
+
+// 任意键松手时调用
+void ar_keywake_release(ar_keywake_t *k, uint32_t now_ms);
+
+// 单击、双击、长按到达时调用:返回 true 表示交给菜单等功能处理,
+// false 表示它属于亮屏那次手势,应当忽略
+bool ar_keywake_action(ar_keywake_t *k);
+
+// 供电方式跟踪。插着 USB 主机与电池供电的熄屏时限不同(30 分钟与 30 秒),
+// 拔线瞬间若仍按最近一次亮屏事件计时,亮着的屏幕会立刻熄灭
+typedef struct {
+    bool known;    // 是否已记录过供电方式
+    bool on_usb;   // 上一次的供电方式
+} ar_power_t;
+
+void ar_power_init(ar_power_t *p);
+
+// 每个周期调用一次。返回 true 表示调用方应记一次亮屏事件:从 USB 主机供电变为电池供电,
+// 且此刻屏幕亮着。屏幕已熄灭时(包括 Mac 睡眠导致 USB 主机离线)不点亮;插上 USB 不在这里点亮,
+// 连上电脑另有亮屏事件。第一次调用只记录基准
+bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on);
+
 // 背光百分比,0 表示熄屏。“低亮度”为 AR_DIM_PERCENT 与设定亮度中较低者。
 // - 电池供电:亮屏事件后 AR_BATTERY_OFF_AFTER_MS 内用低亮度,之后熄屏;
 // - 插着 USB 主机且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏;
@@ -193,8 +237,12 @@ typedef struct {
     bool confirming;            // 正在等用户确认配对
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
     uint32_t ms_since_key;      // 距最近一次按键,从未按过传 UINT32_MAX
+    uint32_t ms_dark;           // 屏幕已持续熄灭的时长,亮着时为 0
 } ar_sleep_in_t;
 
-// 是否该进入深睡:没接 USB 主机、电量计正常、不在配对确认,且“未连接”与无按键
-// 都已满 AR_DEEP_SLEEP_AFTER_MS。在线时(包括“睡觉中”)从不深睡,以免错过“等你处理”。
+// 是否该进入深睡(关机,按任意键唤醒)。前提是没接 USB 主机、电量计正常、不在配对确认,
+// 满足其一即睡:
+// - “未连接”与无按键都已满 AR_DEEP_SLEEP_AFTER_MS;
+// - 屏幕持续熄灭已满 AR_POWER_OFF_AFTER_DARK_MS。在线时也适用:等你处理、有会话完成
+//   都会点亮屏幕并重新计时,所以只有长时间没有任何通知和按键才会关机。
 bool ar_model_should_deep_sleep(const ar_sleep_in_t *in);

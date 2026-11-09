@@ -12,11 +12,13 @@
 //                     确定双击回一级;3 秒无按键回首页
 //   上     按住 5 秒 清除蓝牙配对
 //   配对确认时       确定 = 接受,下 = 拒绝
-//   任意键           背光关闭时只唤醒屏幕;深睡时唤醒设备(重新启动)
+//   任意键           背光关闭时按下即亮屏,这次手势不执行按键操作;深睡时唤醒设备(重新启动)
 //
 // 亮屏与熄屏:按键、通知(等你处理增加、有会话完成)、连上电脑、配对确认都会点亮屏幕,
-// 之后按供电方式调暗、熄屏,规则见 ar_model_backlight_percent()。
-// 电池供电、“未连接”且无按键满 30 分钟时进入深睡,规则见 ar_model_should_deep_sleep()。
+// 之后按供电方式调暗、熄屏,规则见 ar_model_backlight_percent()。拔掉 USB 时屏幕若亮着,
+// 也算一次亮屏事件,见 ar_power_update()。
+// 电池供电时,“未连接”且无按键满 30 分钟,或熄屏满 1 小时,进入深睡(关机,按任意键唤醒),
+// 规则见 ar_model_should_deep_sleep()。
 #include <string.h>
 
 #include "agent_run/ar_ble.h"
@@ -84,6 +86,9 @@ static ar_chime_t s_chime;
 static uint16_t s_done_flash_count;         // “完成 +N”里的 N,提示期间新完成的轮数累加
 static ar_menu_t s_menu;                    // 设置菜单的层级与选中项
 static int64_t s_done_flash_until_us;       // “完成 +N”提示的截止时刻
+static ar_keywake_t s_keywake;              // 熄屏时按键亮屏,并吞掉这次手势的动作
+static ar_power_t s_power;                  // 供电方式,拔掉 USB 时据此补记亮屏事件
+static int64_t s_dark_since_us;             // 屏幕熄灭的时刻,亮着时为 0
 
 // 两个时刻之间的毫秒数;from 为 0(从未发生)时返回 UINT32_MAX
 static uint32_t ms_since(int64_t from_us, int64_t now_us) {
@@ -125,26 +130,34 @@ static void apply_adjust(uint8_t item, int delta) {
 
 // 处理按键。pairing 为 true 时,确定与下键用于接受、拒绝配对
 static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
-    // 上键按住 5 秒清除配对:按 PRESS 与 RELEASE 的间隔计时
-    if (in->btn == BSP_BTN_UP && in->event == BSP_BTN_PRESS) {
-        s_up_pressed_us = now_us;
+    const uint32_t now_ms = (uint32_t)(now_us / 1000);
+    // 任意键按下都立刻亮屏:按键组件对三连击等手势不发单击、双击、长按事件,
+    // 只在这些事件上亮屏会漏掉它们。熄屏时按下的这次手势只亮屏,其动作由 ar_keywake 吞掉
+    if (in->event == BSP_BTN_PRESS) {
+        ar_keywake_press(&s_keywake, s_backlight == 0, now_ms);
+        s_last_key_us = now_us;
+        s_last_wake_us = now_us;
+        // 上键按住 5 秒清除配对:按 PRESS 与 RELEASE 的间隔计时
+        if (in->btn == BSP_BTN_UP) s_up_pressed_us = now_us;
         return;
     }
-    if (in->btn == BSP_BTN_UP && in->event == BSP_BTN_RELEASE) {
-        if (s_up_pressed_us && now_us - s_up_pressed_us >= CLEAR_BOND_HOLD_US) {
-            ar_ble_clear_bonds();
-            s_cleared_until_us = now_us + CLEARED_NOTICE_US;
+    if (in->event == BSP_BTN_RELEASE) {
+        ar_keywake_release(&s_keywake, now_ms);
+        if (in->btn == BSP_BTN_UP) {
+            if (s_up_pressed_us && now_us - s_up_pressed_us >= CLEAR_BOND_HOLD_US) {
+                ar_ble_clear_bonds();
+                s_cleared_until_us = now_us + CLEARED_NOTICE_US;
+            }
+            s_up_pressed_us = 0;
         }
-        s_up_pressed_us = 0;
         return;
     }
-    // 长按目前不分配功能,但仍算按键:唤醒屏幕、推迟熄屏与深睡
+    // 长按目前不分配功能,但仍算按键:推迟熄屏与深睡
     if (in->event != BSP_BTN_CLICK && in->event != BSP_BTN_DOUBLE && in->event != BSP_BTN_LONG) return;
 
-    const bool was_dark = s_backlight == 0;
     s_last_key_us = now_us;
     s_last_wake_us = now_us;
-    if (was_dark) return;   // 背光关闭时只唤醒
+    if (!ar_keywake_action(&s_keywake)) return;   // 亮屏那次手势的动作不执行
 
     if (pairing) {
         if (in->event == BSP_BTN_CLICK && in->btn == BSP_BTN_OK) ar_ble_pair_key(true);
@@ -181,8 +194,8 @@ static void enter_deep_sleep(void) {
     // 持有 LVGL 锁直到入睡:LVGL 不再刷屏,这是显示深睡准备的前提
     if (!bsp_lvgl_lock(LVGL_LOCK_TIMEOUT_MS)) return;
 
-    ESP_LOGI(TAG, "电池供电且未连接已满 %u 分钟,进入深睡,按任意键唤醒",
-             (unsigned)(AR_DEEP_SLEEP_AFTER_MS / 60000u));
+    ESP_LOGI(TAG, "电池供电,未连接满 %u 分钟或熄屏满 %u 分钟,进入深睡,按任意键唤醒",
+             (unsigned)(AR_DEEP_SLEEP_AFTER_MS / 60000u), (unsigned)(AR_POWER_OFF_AFTER_DARK_MS / 60000u));
 
     // 各步失败只记日志、继续入睡:深睡会切断这些外设的活动,留在运行态反而更耗电
     if (ar_ble_stop() != ESP_OK) ESP_LOGW(TAG, "蓝牙停止失败");
@@ -270,9 +283,13 @@ static void app_task(void *arg) {
         } else {
             s_disconnected_since_us = 0;
         }
+        // 拔掉 USB 时屏幕若亮着,补记一次亮屏事件:否则按电池规则(亮屏事件后 30 秒)
+        // 计时早已超时,亮着的屏幕会在拔线瞬间熄灭
+        const bool on_usb = usb_serial_jtag_is_connected();
+        if (ar_power_update(&s_power, on_usb, s_backlight > 0)) s_last_wake_us = now;
         const ar_backlight_in_t bl_in = {
             .screen = screen,
-            .on_usb_power = usb_serial_jtag_is_connected(),
+            .on_usb_power = on_usb,
             .level = s_brightness,
             .ms_since_wake = ms_since(s_last_wake_us, now),
             .ms_disconnected = s_disconnected_since_us ? ms_since(s_disconnected_since_us, now) : 0,
@@ -285,14 +302,21 @@ static void app_task(void *arg) {
             s_backlight = backlight;
             bsp_display_backlight(backlight);
         }
+        // 记录熄屏的起点,供“熄屏满 1 小时关机”计时;一亮屏就清零
+        if (backlight == 0) {
+            if (s_dark_since_us == 0) s_dark_since_us = now;
+        } else {
+            s_dark_since_us = 0;
+        }
 
-        // 深睡:电池供电且长时间未连接。电量计读不到时可能没装电池,不睡
+        // 深睡:电池供电且长时间未连接,或熄屏满 1 小时。电量计读不到时可能没装电池,不睡
         const ar_sleep_in_t sleep_in = {
             .on_usb_power = bl_in.on_usb_power,
             .battery_present = s_battery >= 0,
             .confirming = ble.confirming,
             .ms_disconnected = bl_in.ms_disconnected,
             .ms_since_key = ms_since(s_last_key_us, now),
+            .ms_dark = s_dark_since_us ? ms_since(s_dark_since_us, now) : 0,
         };
         if (ar_model_should_deep_sleep(&sleep_in)) enter_deep_sleep();
 
@@ -365,6 +389,8 @@ void app_main(void) {
     ar_notice_init(&s_notice);
     ar_menu_init(&s_menu);
     ar_chime_init(&s_chime);
+    ar_keywake_init(&s_keywake);
+    ar_power_init(&s_power);
 
     if (bsp_audio_init() == ESP_OK) {
         if (ar_sound_init() != ESP_OK) ESP_LOGW(TAG, "提示音任务创建失败");
