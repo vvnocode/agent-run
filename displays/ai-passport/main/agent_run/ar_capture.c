@@ -25,7 +25,9 @@ static const char *TAG = "ar_capture";
 
 #define SCREEN_W 240
 #define SCREEN_H 320
-#define BAND_H 64                  // 条带缓冲 240×64×2 = 30 KB
+// 条带缓冲 240×40×2 = 19.2 KB,分 8 条渲染。LVGL 内存池调到 32 KB 后,开机空闲堆的最大连续块
+// 约 28 KB,原来 64 行(30 KB)的条带申请不到
+#define BAND_H 40
 #define WRITE_CHUNK 512            // 小于驱动 1 KB 的发送环形缓冲
 #define WRITE_TIMEOUT_MS 100
 #define MAX_STALLS 30              // 连续这么多次写不进去就放弃(约 3 秒)

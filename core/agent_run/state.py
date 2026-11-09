@@ -52,6 +52,10 @@ _TO_IDLE = "to_idle"
 # 对外快照：各工具工作中数量、今日完成数、等你处理总数与按先后排序的等待列表
 Snapshot = namedtuple("Snapshot", "cc cx ds done wn waiting")
 
+# 单个工具的计数（专用页面方案 §5.1）：等你处理数、后台运行数、今日完成数。
+# 工作中沿用 Snapshot 的 cc / cx / ds，这里不重复
+ToolCounts = namedtuple("ToolCounts", "wn bg done")
+
 
 def _background_count(msg):
     """Stop 事件携带的后台任务数（ar_hook.py 转发的 bg）；缺失或不是整数时按 0 处理。"""
@@ -97,12 +101,15 @@ class _Session:
 class Aggregator:
     """按“工具 + session_id”聚合会话状态，并给出快照。"""
 
-    def __init__(self, clock=time.time, day_of=local_day, initial_done=None, rules=None):
+    def __init__(self, clock=time.time, day_of=local_day, initial_done=None, rules=None,
+                 initial_done_by_tool=None):
         """
         clock:        返回当前时间戳的函数（测试时注入假时钟）
         day_of:       把时间戳换算成本地日期字符串的函数
         initial_done: 守护进程重启时恢复的 (日期, 完成数)；日期不是今天则作废
         rules:        覆盖 DEFAULT_RULES 的映射规则
+        initial_done_by_tool: 与 initial_done 同日的按工具完成数 {工具: 数量}；
+                      旧版 state.json 没有这一项时为 None，按 0 处理
         """
         self._clock = clock
         self._day_of = day_of
@@ -121,8 +128,13 @@ class Aggregator:
 
         self._day = day_of(clock())
         self._done = 0
+        self._done_by_tool = dict.fromkeys(HOOK_TOOLS, 0)
         if initial_done and initial_done[0] == self._day:
             self._done = int(initial_done[1])
+            # 只恢复已知工具的非负整数，文件被改坏时不让异常值进入计数
+            for tool, count in (initial_done_by_tool or {}).items():
+                if tool in self._done_by_tool and not isinstance(count, bool) and isinstance(count, int):
+                    self._done_by_tool[tool] = max(0, count)
 
     # ------------------------------------------------------------------
     # 输入
@@ -180,6 +192,26 @@ class Aggregator:
         return Snapshot(cc=working["claude"], cx=working["codex"], ds=ds, done=self._done,
                         wn=len(items), waiting=items)
 
+    def tool_counts(self):
+        """按工具给出等你处理、后台运行、今日完成三项计数，供专用页面使用。
+
+        统计口径与 snapshot() 一致：挂起的异步提问算等你处理；后台运行的会话
+        同时计入 snapshot() 的工作中，这里单独给出其数量。
+        """
+        wn = dict.fromkeys(HOOK_TOOLS, 0)
+        bg = dict.fromkeys(HOOK_TOOLS, 0)
+        for (tool, _sid), s in self._sessions.items():
+            if s.is_waiting():
+                wn[tool] += 1
+            elif s.state == BACKGROUND:
+                bg[tool] += 1
+        return {tool: ToolCounts(wn=wn[tool], bg=bg[tool], done=self._done_by_tool[tool])
+                for tool in HOOK_TOOLS}
+
+    def done_by_tool(self):
+        """按工具的今日完成数（副本），供守护进程写入 state.json。"""
+        return dict(self._done_by_tool)
+
     def recent_events(self):
         """最近收到的事件（只含时间、工具、事件名、工具名、通知类型），供排查使用。"""
         return list(self._recent)
@@ -202,6 +234,7 @@ class Aggregator:
         if today != self._day:
             self._day = today
             self._done = 0
+            self._done_by_tool = dict.fromkeys(HOOK_TOOLS, 0)
 
     def _apply(self, msg):
         """校验事件并把它作用到对应会话上。"""
@@ -262,6 +295,7 @@ class Aggregator:
             self._roll_day(self._clock())
             if s.state != IDLE:
                 self._done += 1
+                self._done_by_tool[tool] += 1
             s.to_idle()
         elif target == _TO_IDLE:
             s.to_idle()

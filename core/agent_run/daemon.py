@@ -4,7 +4,8 @@
 1. 在 $AGENT_RUN_HOME/run/ar.sock 接收 hook 事件与控制命令（Unix 数据报）；
 2. 定时执行超时回收、日切与 dsh 扫描；
 3. 维护到设备的串口链路：握手、状态变化立刻发送、每 2 秒心跳、断开后每 3 秒重连；
-4. 写 run/status.json 供 `agent-run status` 查看，写 state.json 保存今日完成数。
+4. 按工具发送专用页面的 A 帧（计数与订阅用量），内容变化时才发送（专用页面方案 §5.2）；
+5. 写 run/status.json 供 `agent-run status` 查看，写 state.json 保存今日完成数。
 
 Daemon.step() 执行一轮调度，所有时间都取自注入的时钟，便于用假时钟测试。
 """
@@ -16,9 +17,10 @@ import socket
 import time
 
 from .dsh import count_working
-from .protocol import encode_state, parse_device_line
+from .protocol import encode_agent, encode_state, parse_device_line
 from .serial_link import LinkClosed, SerialLink
-from .state import Aggregator, Snapshot, local_day
+from .state import Aggregator, Snapshot, ToolCounts, local_day
+from .usage import EMPTY, NO_LIMIT, Window
 
 log = logging.getLogger("agent-run")
 
@@ -45,6 +47,16 @@ DEMO_SCREENS = [
     Snapshot(cc=2, cx=1, ds=0, done=21, wn=2, waiting=[("claude", "A"), ("codex", "Q")]),  # 等你处理
 ]
 
+# 有专用页面的工具，按设备上的页面顺序（专用页面方案 §4.1）
+AGENT_TOOLS = ("claude", "codex")
+
+# 演示模式下专用页面的示例数据：(计数, 5 小时窗口, 每周窗口, 套餐)，窗口为 (已用百分比, 距重置秒数)。
+# 含一个 ≥80% 的窗口（进度条变橙色）和一个“无此限额”的窗口（专用页面方案 §5.5）
+DEMO_AGENTS = {
+    "claude": (ToolCounts(wn=1, bg=1, done=8), (86.0, 2 * 3600 + 15 * 60), (41.0, 3 * 86400 + 5 * 3600), "Max 5x"),
+    "codex": (ToolCounts(wn=1, bg=0, done=13), NO_LIMIT, (23.0, 6 * 86400 + 2 * 3600), "Pro Lite"),
+}
+
 # 每轮最多处理的数据报数，防止事件风暴饿死链路维护
 _MAX_DATAGRAMS_PER_STEP = 256
 
@@ -62,6 +74,32 @@ def _write_json_atomic(path, data):
     os.replace(tmp, path)
 
 
+def _window_json(window):
+    """把用量窗口写成 status.json 里的值：{"used", "resets_at"}、"none" 或 null。"""
+    if window is None or window == NO_LIMIT:
+        return window
+    return {"used": window.used, "resets_at": window.resets_at}
+
+
+class _NoUsage:
+    """未配置用量采集时的占位（测试与旧调用方）：所有窗口都是暂无数据。"""
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def step(self, now):
+        pass
+
+    def on_stop(self, tool, now):
+        pass
+
+    def get(self, tool):
+        return EMPTY
+
+
 def _read_json(path, default):
     try:
         with open(path) as f:
@@ -72,7 +110,7 @@ def _read_json(path, default):
 
 class Daemon:
     def __init__(self, home=None, clock=time.time, link_factory=SerialLink, port_finder=None,
-                 dsh_root=None, day_of=local_day, rules=None, ble_factory=None):
+                 dsh_root=None, day_of=local_day, rules=None, ble_factory=None, usage=None):
         """
         home:         运行数据目录
         clock:        时钟函数
@@ -82,6 +120,7 @@ class Daemon:
         dsh_root:     dsh 会话根目录；None 表示不扫描
         day_of:       时间戳到本地日期的换算
         rules:        事件映射规则覆盖
+        usage:        订阅用量采集（usage.UsageCollector）；None 表示不采集，专用页面显示暂无数据
         """
         self.home = home or default_home()
         self.run_dir = os.path.join(self.home, "run")
@@ -96,6 +135,7 @@ class Daemon:
         self._dsh_root = dsh_root
         self._day_of = day_of
         self._rules = rules
+        self._usage = usage if usage is not None else _NoUsage()
 
         self._sock = None
         self._agg = None
@@ -103,6 +143,7 @@ class Daemon:
         self._port = None
         self._seq = 0
         self._last_sent = None
+        self._last_agent = {}       # 每个工具上一次发出的 A 帧，内容变化才重发
         self._last_send_at = 0.0
         self._next_retry = 0.0
         self._next_tick = 0.0
@@ -127,14 +168,21 @@ class Daemon:
 
         saved = _read_json(self.state_path, {})
         initial = None
+        by_tool = None
         if isinstance(saved, dict) and "day" in saved and "done" in saved:
             initial = (saved["day"], saved["done"])
-        self._agg = Aggregator(clock=self._clock, day_of=self._day_of, initial_done=initial, rules=self._rules)
-        self._last_done = self._agg.done_record()
+            # 旧版 state.json 没有 done_by_tool，按 0 处理
+            if isinstance(saved.get("done_by_tool"), dict):
+                by_tool = saved["done_by_tool"]
+        self._agg = Aggregator(clock=self._clock, day_of=self._day_of, initial_done=initial, rules=self._rules,
+                               initial_done_by_tool=by_tool)
+        self._last_done = self._done_state()
+        self._usage.start()
 
     def close(self):
         """关闭链路与 socket，删除 socket 文件。"""
         self._drop_link("守护进程退出")
+        self._usage.close()
         if self._sock is not None:
             self._sock.close()
             self._sock = None
@@ -169,6 +217,8 @@ class Daemon:
             self._agg.set_dsh_working(count_working(self._dsh_root, now, window=DSH_WINDOW_SECONDS))
             self._next_dsh = now + DSH_SCAN_SECONDS
 
+        self._usage.step(now)
+
         self._maybe_connect(now)
         self._read_device()
 
@@ -178,6 +228,8 @@ class Daemon:
             due = now - self._last_send_at >= heartbeat
             if snap != self._last_sent or due:
                 self._send(snap, now)
+        if self._link is not None and not paused:
+            self._send_agents(now)
 
         self._write_status(now)
         self._persist_done()
@@ -199,6 +251,9 @@ class Daemon:
                 self._handle_ctl(msg, now)
             else:
                 self._agg.handle(msg)
+                # 一轮结束后用量可能刚变化，让用量采集提前刷新
+                if msg.get("event") == "Stop":
+                    self._usage.on_stop(msg.get("tool"), now)
 
     def _handle_ctl(self, msg, now):
         """控制命令：目前只有 demo。"""
@@ -217,6 +272,7 @@ class Daemon:
                 return None, True  # 停发心跳，让设备超时显示“未连接”
             self._demo_start = None
             self._last_sent = None
+            self._last_agent = {}
             log.info("演示模式结束")
         return self._agg.snapshot(), False
 
@@ -261,6 +317,7 @@ class Daemon:
         self._link = link
         self._port = where
         self._last_sent = None  # 新连接立刻发送一帧完整状态
+        self._last_agent = {}   # 以及每个工具的 A 帧
         self._next_usb_check = now + RETRY_SECONDS
         log.info("已连接设备 %s（%s，固件 %s）", where, self._link_kind(), hello.get("fw", "?"))
 
@@ -295,6 +352,7 @@ class Daemon:
             if msg and msg.get("type") == "HELLO":
                 log.info("设备重新上线（固件 %s）", msg.get("fw", "?"))
                 self._last_sent = None
+                self._last_agent = {}
 
     def _send(self, snap, now):
         """发送一帧状态；写失败时断开链路，等待下次重连。"""
@@ -306,6 +364,29 @@ class Daemon:
         else:
             self._drop_link("写入失败")
             self._next_retry = now + RETRY_SECONDS
+
+    def _agent_values(self, tool, counts, now):
+        """返回某个工具 A 帧的 (计数, 5 小时窗口, 每周窗口, 套餐)；演示模式下用示例数据。"""
+        if self._demo_start is not None:
+            demo_counts, five, seven, plan = DEMO_AGENTS[tool]
+            to_window = lambda w: w if w == NO_LIMIT else Window(w[0], now + w[1])
+            return demo_counts, to_window(five), to_window(seven), plan
+        usage = self._usage.get(tool)
+        return counts[tool], usage.five_hour, usage.seven_day, usage.plan
+
+    def _send_agents(self, now):
+        """按工具发送 A 帧：内容变化时才发（距重置分钟数每分钟变一次），不随心跳重发。"""
+        counts = self._agg.tool_counts()
+        for tool in AGENT_TOOLS:
+            tool_counts, five, seven, plan = self._agent_values(tool, counts, now)
+            line = encode_agent(tool, tool_counts, five, seven, now, plan)
+            if line == self._last_agent.get(tool):
+                continue
+            if not self._link.write_line(line):
+                self._drop_link("写入失败")
+                self._next_retry = now + RETRY_SECONDS
+                return
+            self._last_agent[tool] = line
 
     def _drop_link(self, reason):
         if self._link is not None:
@@ -333,6 +414,7 @@ class Daemon:
             "port": self._port,
             "demo": self._demo_start is not None,
             "recent": self._agg.recent_events(),
+            "agents": self._agents_status(),
         }
         if status == self._last_status and now - self._last_status_at < STATUS_REFRESH_SECONDS:
             return
@@ -340,9 +422,32 @@ class Daemon:
         self._last_status_at = now
         _write_json_atomic(self.status_path, dict(status, updated=now))
 
+    def _agents_status(self):
+        """status.json 的 agents 部分：每个工具的计数、用量、数据时间、最近一次失败原因与套餐。"""
+        counts = self._agg.tool_counts()
+        agents = {}
+        for tool in AGENT_TOOLS:
+            usage = self._usage.get(tool)
+            agents[tool] = {
+                "wn": counts[tool].wn,
+                "bg": counts[tool].bg,
+                "done": counts[tool].done,
+                "five_hour": _window_json(usage.five_hour),
+                "seven_day": _window_json(usage.seven_day),
+                "usage_updated": usage.updated,
+                "usage_error": usage.error,
+                "plan": usage.plan,      # 套餐显示名，未知时为 None
+            }
+        return agents
+
+    def _done_state(self):
+        """state.json 的内容：日期、今日完成总数与按工具的完成数。"""
+        day, done = self._agg.done_record()
+        return {"day": day, "done": done, "done_by_tool": self._agg.done_by_tool()}
+
     def _persist_done(self):
         """今日完成数变化时写入 state.json，守护进程重启后可恢复。"""
-        record = self._agg.done_record()
+        record = self._done_state()
         if record != self._last_done:
             self._last_done = record
-            _write_json_atomic(self.state_path, {"day": record[0], "done": record[1]})
+            _write_json_atomic(self.state_path, record)

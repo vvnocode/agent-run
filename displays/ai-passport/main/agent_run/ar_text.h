@@ -48,6 +48,19 @@
 #define AR_TXT_VOLUME_MID "中"
 #define AR_TXT_VOLUME_HIGH "高"
 
+// 工具专用页面(专用页面方案 §4.2)
+#define AR_TXT_USAGE_FIVE_HOUR "5 小时用量"
+#define AR_TXT_USAGE_WEEK "每周用量"
+#define AR_TXT_USAGE_NO_DATA "暂无数据"
+#define AR_TXT_USAGE_NO_LIMIT "无此限额"
+#define AR_TXT_RESET_MIN_FMT "%u 分钟后重置"
+#define AR_TXT_RESET_HOUR_FMT "%u 小时 %u 分后重置"
+#define AR_TXT_RESET_DAY_FMT "%u 天 %u 小时后重置"
+#define AR_TXT_RESET_UNKNOWN "重置时间未知"
+#define AR_TXT_TILE_WORKING "工作中"
+#define AR_TXT_TILE_BACKGROUND "后台运行"
+#define AR_TXT_PAGE_HINT "上下键切换"
+
 // 工具名(等待列表)
 #define AR_TXT_TOOL_CC "Claude Code"
 #define AR_TXT_TOOL_CX "Codex"

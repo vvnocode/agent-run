@@ -133,6 +133,7 @@ static void notify_line(uint16_t conn, const char *line) {
 
 static void handle_line(uint16_t conn, const char *line) {
     ar_state_t st;
+    ar_agent_t agent;
     switch (ar_proto_parse_line(line, &st)) {
     case AR_LINE_STATE:
         ar_link_publish(&st, AR_SRC_BLE);
@@ -141,6 +142,8 @@ static void handle_line(uint16_t conn, const char *line) {
         notify_line(conn, ar_link_hello_line());
         break;
     default:
+        // 工具专用页面的 A 帧,与 USB 来源同样处理
+        if (ar_proto_parse_agent(line, &agent)) ar_link_publish_agent(&agent);
         break;
     }
 }

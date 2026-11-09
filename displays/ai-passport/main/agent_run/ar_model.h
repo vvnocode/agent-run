@@ -1,10 +1,12 @@
 // main/agent_run/ar_model.h —— Agent Run! 画面选择与交互规则(纯 C,可宿主测试)。
 //
 // 把“收到的状态 + 时间”换算成要显示的画面、动画帧间隔、速度条格数、
-// 通知与提示音、音量、亮度、设置菜单与背光。规则见设计方案 §7.2、§7.5 与无线方案 §4.4、§7.4。
+// 通知与提示音、音量、亮度、设置菜单与背光,以及工具专用页面的切换与文字。
+// 规则见设计方案 §7.2、§7.5、无线方案 §4.4、§7.4 与专用页面方案 §4。
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "ar_proto.h"
@@ -82,6 +84,34 @@ uint16_t ar_model_frame_interval_ms(ar_screen_t screen);
 
 // 速度条点亮的格数(0-4)
 uint8_t ar_model_speed_bars(ar_screen_t screen);
+
+// 工具专用页面(专用页面方案 §4.1)。页面顺序:首页 → Claude Code → Codex → 首页
+typedef enum {
+    AR_PAGE_HOME = 0,   // 首页:宠物与计数
+    AR_PAGE_CC,         // Claude Code 专用页面
+    AR_PAGE_CX,         // Codex 专用页面
+    AR_PAGE_COUNT,
+} ar_page_t;
+
+// 用量达到这个百分比时,专用页面的进度条改用警示色
+#define AR_USAGE_ALERT_PERCENT 80u
+
+// 切页:delta 为正(下键)前进、为负(上键)后退,循环;越界的 page 按首页算
+uint8_t ar_page_step(uint8_t page, int delta);
+
+// 实际显示的页面:未连接、等你处理覆盖专用页面(显示首页的对应画面),其余时候为用户所在页面。
+// 配对确认与设置菜单是浮层,由界面直接盖在上面,不在这里处理
+uint8_t ar_page_shown(uint8_t page, ar_screen_t screen);
+
+// 上下键是否用于切页:设置菜单打开、配对确认、未连接、等你处理时都不切页
+bool ar_page_keys_active(ar_screen_t screen, bool menu_open, bool pairing);
+
+// 距重置时间的文字,写入 buf(总以 NUL 结尾):不足 1 小时为“N 分钟后重置”,不足 1 天为
+// “N 小时 M 分后重置”,否则为“N 天 M 小时后重置”;AR_RESET_UNKNOWN 为“重置时间未知”
+void ar_reset_text(uint16_t minutes, char *buf, size_t size);
+
+// 用量是否达到警示线;暂无数据、无此限额不算
+bool ar_usage_alert(uint8_t percent);
 
 // 状态帧带来的通知:等你处理增加、有会话完成。每收到一帧新状态调用一次 ar_notice_update()。
 typedef struct {

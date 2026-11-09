@@ -94,7 +94,75 @@ static void test_overlong_line_is_dropped_until_next_terminator(void) {
     assert(strcmp(last, "AR1 PING") == 0);
 }
 
+// 工具专用页面的 A 帧(专用页面方案 §5.2)
+static void test_agent_frame(void) {
+    ar_agent_t a;
+    assert(ar_proto_parse_agent("AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110", &a));
+    assert(a.tool == AR_TOOL_CX && a.wn == 0 && a.bg == 0 && a.done == 3);
+    assert(a.h == AR_USAGE_NO_LIMIT && a.hr == AR_RESET_UNKNOWN);
+    assert(a.w == 5 && a.wr == 6110);
+
+    // 未知键忽略;上限值合法
+    assert(ar_proto_parse_agent("AR1 A t=CC wn=99 bg=99 done=999 h=- hr=- w=100 wr=20160 future=1", &a));
+    assert(a.tool == AR_TOOL_CC && a.wn == 99 && a.bg == 99 && a.done == 999);
+    assert(a.h == AR_USAGE_UNKNOWN && a.hr == AR_RESET_UNKNOWN && a.w == 100 && a.wr == 20160);
+
+    // 状态帧解析不认 A 帧,旧的解析路径不受影响
+    ar_state_t st;
+    assert(ar_proto_parse_line("AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=-", &st) == AR_LINE_IGNORED);
+}
+
+// A 帧的订阅类型 p(专用页面方案 §9):下划线还原为空格;没有 p 时为空串
+static void test_agent_plan(void) {
+    ar_agent_t a;
+    assert(ar_proto_parse_agent("AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110 p=Pro_Lite", &a));
+    assert(strcmp(a.plan, "Pro Lite") == 0);
+    assert(a.tool == AR_TOOL_CX && a.w == 5 && a.wr == 6110);
+
+    // 最长 10 个字符;p 可以出现在任意位置
+    assert(ar_proto_parse_agent("AR1 A t=CC p=Enterprise wn=0 bg=0 done=0 h=- hr=- w=- wr=-", &a));
+    assert(strcmp(a.plan, "Enterprise") == 0);
+
+    // 主机端是旧版本或没有套餐数据:不带 p,套餐为空
+    assert(ar_proto_parse_agent("AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=-", &a));
+    assert(a.plan[0] == '\0');
+}
+
+static void test_invalid_agent_frames_do_not_touch_output(void) {
+    const char *bad[] = {
+        "AR1 A t=DS wn=0 bg=0 done=0 h=- hr=- w=- wr=-",       // 没有专用页面的工具
+        "AR1 A t=XX wn=0 bg=0 done=0 h=- hr=- w=- wr=-",       // 未知工具代号
+        "AR1 A wn=0 bg=0 done=0 h=- hr=- w=- wr=-",            // 缺 t
+        "AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=-",            // 缺 wr
+        "AR1 A t=CC wn=100 bg=0 done=0 h=- hr=- w=- wr=-",     // wn 越界
+        "AR1 A t=CC wn=0 bg=0 done=1000 h=- hr=- w=- wr=-",    // done 越界
+        "AR1 A t=CC wn=0 bg=0 done=0 h=101 hr=- w=- wr=-",     // 百分比越界
+        "AR1 A t=CC wn=0 bg=0 done=0 h=5 hr=20161 w=- wr=-",   // 分钟越界
+        "AR1 A t=CC wn=0 bg=0 done=0 h=y hr=- w=- wr=-",       // 用量只接受数字、- 与 x
+        "AR1 A t=CC wn=0 bg=0 done=0 h=5 hr=x w=- wr=-",       // 分钟只接受数字与 -
+        "AR1 A t=CC wn=- bg=0 done=0 h=- hr=- w=- wr=-",       // 计数不接受 -
+        "AR1 A  t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=-",      // 连续空格
+        "AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=- p=",    // 套餐为空
+        "AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=- p=Max-5x",       // 套餐只接受字母、数字与下划线
+        "AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=- p=Enterprises",  // 套餐超过 10 个字符
+        "AR1 S seq=1 cc=0 cx=0 ds=0 done=0 wn=0 w=-",          // 状态帧
+        "AR1 A",
+        "AR1 PING",
+        "hello",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        ar_agent_t a;
+        memset(&a, 0xAB, sizeof(a));
+        ar_agent_t before = a;
+        assert(!ar_proto_parse_agent(bad[i], &a));
+        assert(memcmp(&a, &before, sizeof(a)) == 0);
+    }
+}
+
 int main(void) {
+    test_agent_frame();
+    test_agent_plan();
+    test_invalid_agent_frames_do_not_touch_output();
     test_valid_frame();
     test_empty_wait_list_and_unknown_keys();
     test_invalid_frames_do_not_touch_output();
