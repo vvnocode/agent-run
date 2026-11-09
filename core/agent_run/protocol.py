@@ -1,4 +1,7 @@
 """串口协议（设计方案 §6）：主机状态帧编码与设备回包解析。"""
+import math
+
+from .usage import NO_LIMIT
 
 # 单行最大字节数（含行尾），设备端按同一上限丢弃超长行
 MAX_LINE = 160
@@ -36,6 +39,49 @@ def encode_state(snap, seq):
         _clamp(snap.done, 999),
         _clamp(snap.wn, 99),
         waiting,
+    )
+
+
+# A 帧里距重置分钟数的上限（两周），保证字段宽度固定在 5 位以内
+MAX_RESET_MINUTES = 20160
+
+
+def _usage_fields(window, now):
+    """把一个限额窗口编码成 (用量, 距重置分钟数) 两个字段。
+
+    暂无数据为 ("-", "-")，无此限额为 ("x", "-")；重置时间已过时用量按 0、重置时间未知
+    （专用页面方案 §3.4）。分钟数向上取整，还剩几十秒时不会显示 0 分钟。
+    """
+    if window is None:
+        return "-", "-"
+    if window == NO_LIMIT:
+        return "x", "-"
+    used, resets_at = window
+    if resets_at is not None and resets_at <= now:
+        return "0", "-"
+    percent = max(0, min(100, int(math.floor(used + 0.5))))
+    if resets_at is None:
+        return str(percent), "-"
+    minutes = min(MAX_RESET_MINUTES, int(math.ceil((resets_at - now) / 60.0)))
+    return str(percent), str(minutes)
+
+
+def encode_agent(tool, counts, five_hour, seven_day, now):
+    """把单个工具的计数与用量编码成一行 A 帧（专用页面方案 §5.2），例如：
+
+    AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110
+
+    counts 为 state.ToolCounts；five_hour、seven_day 为 usage 模块的窗口值；now 为当前 Unix 秒。
+    只含计数、百分比和分钟数，不含账号、套餐或任何会话内容。
+    """
+    h, hr = _usage_fields(five_hour, now)
+    w, wr = _usage_fields(seven_day, now)
+    return "AR1 A t=%s wn=%d bg=%d done=%d h=%s hr=%s w=%s wr=%s\n" % (
+        TOOL_CODES[tool],
+        _clamp(counts.wn, 99),
+        _clamp(counts.bg, 99),
+        _clamp(counts.done, 999),
+        h, hr, w, wr,
     )
 
 

@@ -346,6 +346,57 @@ class AggregatorTest(unittest.TestCase):
         a.set_dsh_working(5)
         self.assertEqual(a.snapshot().ds, 1)
 
+    # ---- 按工具的计数（专用页面方案 §5.1） --------------------------------
+
+    def test_tool_counts_split_waiting_background_and_done(self):
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "c1", 1000.0))
+        a.handle(ev("claude", "PermissionRequest", "c1", 1001.0, tool_name="Bash"))
+        a.handle(ev("claude", "UserPromptSubmit", "c2", 1002.0))
+        a.handle(ev("claude", "Stop", "c2", 1003.0, bg=2))          # 后台运行
+        a.handle(ev("codex", "UserPromptSubmit", "x1", 1004.0))
+        a.handle(ev("codex", "Stop", "x1", 1005.0))                 # 完成 1 次
+        a.handle(ev("codex", "UserPromptSubmit", "x2", 1006.0))
+        a.handle(ev("codex", "Stop", "x2", 1007.0))                 # 完成 2 次
+        counts = a.tool_counts()
+        self.assertEqual((counts["claude"].wn, counts["claude"].bg, counts["claude"].done), (1, 1, 0))
+        self.assertEqual((counts["codex"].wn, counts["codex"].bg, counts["codex"].done), (0, 0, 2))
+        self.assertEqual((counts["dsh"].wn, counts["dsh"].bg, counts["dsh"].done), (0, 0, 0))
+        # 总数仍与快照一致
+        self.assertEqual(a.snapshot().done, 2)
+
+    def test_async_question_counts_as_waiting_for_its_tool(self):
+        a = self.agg
+        a.handle(ev("codex", "UserPromptSubmit", "x1", 1000.0))
+        a.handle(ev("codex", "PreToolUse", "x1", 1001.0, tool_name="request_user_input_async"))
+        a.handle(ev("codex", "Stop", "x1", 1002.0))
+        self.assertEqual(a.tool_counts()["codex"].wn, 1)
+
+    def test_tool_done_resets_on_new_local_day(self):
+        a = self.agg
+        a.handle(ev("claude", "UserPromptSubmit", "c1", 1000.0))
+        a.handle(ev("claude", "Stop", "c1", 1001.0))
+        self.assertEqual(a.done_by_tool()["claude"], 1)
+        self.day[0] = "2026-11-09"
+        a.tick()
+        self.assertEqual(a.done_by_tool(), {"claude": 0, "codex": 0, "dsh": 0})
+        self.assertEqual(a.tool_counts()["claude"].done, 0)
+
+    def test_tool_done_restored_for_same_day_only(self):
+        saved = {"claude": 4, "codex": 1, "bogus": 9, "dsh": "x"}
+        same = Aggregator(clock=self.clock, day_of=lambda t: "2026-11-08",
+                          initial_done=("2026-11-08", 5), initial_done_by_tool=saved)
+        # 未知工具与非整数值丢弃
+        self.assertEqual(same.done_by_tool(), {"claude": 4, "codex": 1, "dsh": 0})
+        other = Aggregator(clock=self.clock, day_of=lambda t: "2026-11-08",
+                           initial_done=("2026-11-07", 5), initial_done_by_tool=saved)
+        self.assertEqual(other.done_by_tool(), {"claude": 0, "codex": 0, "dsh": 0})
+
+    def test_old_state_file_without_tool_done_starts_from_zero(self):
+        a = Aggregator(clock=self.clock, day_of=lambda t: "2026-11-08", initial_done=("2026-11-08", 5))
+        self.assertEqual(a.snapshot().done, 5)
+        self.assertEqual(a.done_by_tool(), {"claude": 0, "codex": 0, "dsh": 0})
+
     # ---- 诊断 -----------------------------------------------------------
 
     def test_recent_events_keep_only_whitelisted_fields(self):

@@ -10,6 +10,7 @@ import time
 import unittest
 
 from agent_run.daemon import DEMO_STEP_SECONDS, Daemon
+from agent_run.usage import EMPTY, NO_LIMIT, ToolUsage, Window
 
 
 class FakeClock:
@@ -28,7 +29,9 @@ class FakeLink:
 
     def __init__(self, path):
         self.path = path
-        self.lines = []
+        self.lines = []          # 状态帧等非 A 帧
+        self.agent_lines = []    # 工具专用页面的 A 帧
+        self.incoming = []       # 设备回包，下一次 read_lines 时交出
         self.closed = False
         self.fail_write = False
         self.hello = True
@@ -43,14 +46,40 @@ class FakeLink:
     def write_line(self, line):
         if self.fail_write:
             return False
-        self.lines.append(line)
+        (self.agent_lines if line.startswith("AR1 A ") else self.lines).append(line)
         return True
 
     def read_lines(self):
-        return []
+        lines, self.incoming = self.incoming, []
+        return lines
 
     def close(self):
         self.closed = True
+
+
+class FakeUsage:
+    """用量采集替身：按工具返回预设用量，记录 Stop 通知与生命周期调用。"""
+
+    def __init__(self):
+        self.data = {}
+        self.stops = []
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def close(self):
+        self.closed = True
+
+    def step(self, now):
+        pass
+
+    def on_stop(self, tool, now):
+        self.stops.append((tool, now))
+
+    def get(self, tool):
+        return self.data.get(tool, EMPTY)
 
 
 class FakeBle:
@@ -62,6 +91,7 @@ class FakeBle:
 
     def __init__(self):
         self.lines = []
+        self.agent_lines = []
         self.closed = False
         FakeBle.instances.append(self)
 
@@ -74,7 +104,7 @@ class FakeBle:
     def write_line(self, line):
         if not FakeBle.ready:
             return False
-        self.lines.append(line)
+        (self.agent_lines if line.startswith("AR1 A ") else self.lines).append(line)
         return True
 
     def read_lines(self):
@@ -100,6 +130,7 @@ class DaemonTest(unittest.TestCase):
         self.clock = FakeClock(1000.0)
         self.port = ["/dev/fake0"]
         self.dsh_root = tempfile.mkdtemp()
+        self.usage = FakeUsage()
         self.daemon = self.make_daemon()
 
     def make_daemon(self):
@@ -110,6 +141,7 @@ class DaemonTest(unittest.TestCase):
             port_finder=lambda: self.port[0],
             dsh_root=self.dsh_root,
             day_of=lambda t: "2026-11-08",
+            usage=self.usage,
         )
         d.start()
         return d
@@ -237,6 +269,99 @@ class DaemonTest(unittest.TestCase):
         self.clock.t += 2.1
         self.daemon.step()
         self.assertEqual(len(self.link().lines), sent)
+
+    # ---- 工具专用页面（专用页面方案 §5） -------------------------------------
+
+    def agent_frames(self):
+        """按工具代号取最近一次发送的 A 帧字段。"""
+        frames = {}
+        for line in self.link().agent_lines:
+            fields = frame_fields(line)
+            frames[fields["t"]] = fields
+        return frames
+
+    def test_agent_frames_sent_for_each_tool_on_connect(self):
+        self.daemon.step()
+        self.assertEqual(self.link().agent_lines, [
+            "AR1 A t=CC wn=0 bg=0 done=0 h=- hr=- w=- wr=-\n",
+            "AR1 A t=CX wn=0 bg=0 done=0 h=- hr=- w=- wr=-\n",
+        ])
+        self.assertTrue(self.usage.started)
+
+    def test_agent_frames_carry_tool_counts_and_usage(self):
+        self.usage.data["codex"] = ToolUsage(NO_LIMIT, Window(5.0, self.clock.t + 6110 * 60), 990.0, None)
+        self.send({"tool": "codex", "event": "UserPromptSubmit", "sid": "x1", "ts": 1000.1})
+        self.send({"tool": "codex", "event": "Stop", "sid": "x1", "ts": 1000.2})
+        self.send({"tool": "claude", "event": "UserPromptSubmit", "sid": "c1", "ts": 1000.3})
+        self.send({"tool": "claude", "event": "PermissionRequest", "sid": "c1", "ts": 1000.4})
+        self.daemon.step()
+        self.assertEqual(self.link().agent_lines[-1], "AR1 A t=CX wn=0 bg=0 done=1 h=x hr=- w=5 wr=6110\n")
+        self.assertEqual(self.agent_frames()["CC"]["wn"], "1")
+
+    def test_agent_frames_resent_only_when_content_changes(self):
+        self.usage.data["claude"] = ToolUsage(Window(20.0, self.clock.t + 3600), None, 990.0, None)
+        self.daemon.step()
+        sent = len(self.link().agent_lines)
+        self.clock.t += 30
+        self.daemon.step()
+        self.assertEqual(len(self.link().agent_lines), sent)        # 心跳不重发 A 帧
+        self.clock.t += 31
+        self.daemon.step()                                           # 距重置分钟数变了
+        self.assertEqual(len(self.link().agent_lines), sent + 1)
+        self.assertEqual(self.agent_frames()["CC"]["hr"], "59")
+        self.send({"tool": "codex", "event": "PermissionRequest", "sid": "x", "ts": 1061.5})
+        self.daemon.step()
+        self.assertEqual(len(self.link().agent_lines), sent + 2)
+        self.assertTrue(self.link().agent_lines[-1].startswith("AR1 A t=CX wn=1 "))
+
+    def test_device_hello_resends_agent_frames(self):
+        self.daemon.step()
+        sent = len(self.link().agent_lines)
+        self.link().incoming = ["AR1 HELLO fw=0.4.0 proto=1"]
+        self.daemon.step()
+        self.assertEqual(len(self.link().agent_lines), sent + 2)
+
+    def test_stop_events_trigger_usage_refresh(self):
+        self.send({"tool": "claude", "event": "UserPromptSubmit", "sid": "c1", "ts": 1000.1})
+        self.send({"tool": "claude", "event": "Stop", "sid": "c1", "ts": 1000.2})
+        self.daemon.step()
+        self.assertEqual(self.usage.stops, [("claude", 1000.0)])
+
+    def test_status_file_lists_agents(self):
+        resets = self.clock.t + 600
+        self.usage.data["claude"] = ToolUsage(Window(23.5, resets), None, 990.0, "用量接口返回 HTTP 429")
+        self.send({"tool": "claude", "event": "UserPromptSubmit", "sid": "c1", "ts": 1000.1})
+        self.send({"tool": "claude", "event": "Stop", "sid": "c1", "ts": 1000.2, "bg": 1})
+        self.daemon.step()
+        with open(os.path.join(self.home, "run", "status.json")) as f:
+            agents = json.load(f)["agents"]
+        self.assertEqual(agents["claude"], {
+            "wn": 0, "bg": 1, "done": 0,
+            "five_hour": {"used": 23.5, "resets_at": resets}, "seven_day": None,
+            "usage_updated": 990.0, "usage_error": "用量接口返回 HTTP 429",
+        })
+        self.assertEqual(agents["codex"]["five_hour"], None)
+
+    def test_tool_done_survives_restart(self):
+        self.send({"tool": "codex", "event": "UserPromptSubmit", "sid": "x1", "ts": 1000.5})
+        self.send({"tool": "codex", "event": "Stop", "sid": "x1", "ts": 1000.6})
+        self.daemon.step()
+        with open(os.path.join(self.home, "state.json")) as f:
+            self.assertEqual(json.load(f)["done_by_tool"], {"claude": 0, "codex": 1, "dsh": 0})
+        self.daemon.close()
+        self.assertTrue(self.usage.closed)
+        self.daemon = self.make_daemon()
+        self.daemon.step()
+        self.assertEqual(self.agent_frames()["CX"]["done"], "1")
+
+    def test_demo_sends_sample_agent_frames(self):
+        self.daemon.step()
+        self.send({"ctl": "demo"})
+        self.daemon.step()
+        frames = self.agent_frames()
+        self.assertGreaterEqual(int(frames["CC"]["h"]), 80)     # 一个 ≥80% 的窗口
+        self.assertEqual(frames["CX"]["h"], "x")                 # 一个“无此限额”的窗口
+        self.assertNotEqual(frames["CX"]["w"], "-")
 
 
 class DaemonBleTest(unittest.TestCase):

@@ -16,6 +16,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -26,6 +27,7 @@ from .ble_link import BleLink
 from .daemon import DEMO_PAUSE_SECONDS, DEMO_SCREENS, DEMO_STEP_SECONDS, Daemon, default_home
 from .ports import find_espressif_ports
 from .serial_link import SerialLink
+from .usage import UsageCollector
 
 # hook 与 launchd 统一使用系统自带的 Python，避免依赖用户环境里的解释器
 SYSTEM_PYTHON = "/usr/bin/python3"
@@ -67,6 +69,8 @@ def cmd_run(args):
         rules=config.get("rules"),
         # 没有 USB 时经蓝牙桥接程序发送
         ble_factory=lambda: BleLink(os.path.join(run_dir, "ble.sock"), os.path.join(run_dir, "ble-status.json")),
+        # Claude Code、Codex 的订阅用量，供设备上的专用页面显示
+        usage=UsageCollector(),
     )
     daemon.start()
     try:
@@ -74,6 +78,31 @@ def cmd_run(args):
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def _countdown(seconds):
+    """距重置时间的文字，与设备专用页面的写法一致（专用页面方案 §4.2）。"""
+    minutes = max(1, int(math.ceil(seconds / 60.0)))
+    if minutes < 60:
+        return "%d 分钟后重置" % minutes
+    if minutes < 24 * 60:
+        return "%d 小时 %d 分后重置" % (minutes // 60, minutes % 60)
+    return "%d 天 %d 小时后重置" % (minutes // (24 * 60), minutes % (24 * 60) // 60)
+
+
+def describe_window(value, now):
+    """status.json 里一个用量窗口的文字：百分比与距重置时间、无此限额或暂无数据。"""
+    if value is None:
+        return "暂无数据"
+    if value == "none":
+        return "无此限额"
+    resets_at = value.get("resets_at")
+    if resets_at is not None and resets_at <= now:
+        return "0%（已重置）"
+    percent = int(math.floor(value.get("used", 0) + 0.5))
+    if resets_at is None:
+        return "%d%%（重置时间未知）" % percent
+    return "%d%%（%s）" % (percent, _countdown(resets_at - now))
 
 
 def cmd_status(args):
@@ -97,6 +126,19 @@ def cmd_status(args):
     print("等你处理：%d" % status["wn"])
     for tool, reason in status.get("waiting", []):
         print("  - %s：%s" % (names.get(tool, tool), reasons.get(reason, reason)))
+
+    # 专用页面的数据：按工具的计数与订阅用量
+    now = time.time()
+    for tool, agent in status.get("agents", {}).items():
+        print("%s：等你处理 %d · 后台运行 %d · 今日完成 %d" % (
+            names.get(tool, tool), agent["wn"], agent["bg"], agent["done"]))
+        print("  5 小时用量 %s · 每周用量 %s" % (
+            describe_window(agent.get("five_hour"), now), describe_window(agent.get("seven_day"), now)))
+        updated = agent.get("usage_updated")
+        if updated:
+            print("  用量数据时间：%d 分钟前" % max(0, (now - updated) // 60))
+        if agent.get("usage_error"):
+            print("  用量未更新：%s" % agent["usage_error"])
 
     # Codex 会静默跳过未信任的 hook，这里主动提示，避免“跑了任务却不计数”
     untrusted = install.codex_untrusted_events(
