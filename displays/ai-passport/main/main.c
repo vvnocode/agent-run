@@ -49,6 +49,13 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "key_guard.h"
+#include "lvgl.h"
+
+// LVGL 内存池下限:全部画面开机时一次创建,池子不够时 LVGL 在 LV_ASSERT_MALLOC 处死循环,
+// 设备开机即被看门狗卡住。已有的 sdkconfig 不会自动采用 sdkconfig.defaults 的新值,在这里拦下
+#if defined(LV_MEM_SIZE) && LV_MEM_SIZE < (32 * 1024)
+#error "LVGL 内存池小于 32 KB:删除 displays/ai-passport/sdkconfig 后重新构建(会按 sdkconfig.defaults 生成)"
+#endif
 
 static const char *TAG = "agent_run";
 
