@@ -1,7 +1,7 @@
 # Agent Run! 工具专用页面设计方案（v1.2：Claude Code、Codex 用量与任务）
 
 - 日期：2026-11-09
-- 状态：待确认（§3 的数据来源需要用户选定后再实现）
+- 状态：已实现（2026-11-09 用户选定 §3.2 方案 A）；实现中的发现与验收记录见 §8
 - 前置：[v1 设计方案](2026-11-08-agent-run-design.md)、[无线方案](2026-11-08-agent-run-wireless-design.md)
 
 ## 1. 目标
@@ -19,7 +19,7 @@
 - 在设备上切换账号或查看会话详情。
 - 云端会话（Claude Code on the web、Codex 云任务）的任务数：采集端只能收到本机 hook 事件，与 v1 相同。
 
-## 3. 用量数据来源（需要选定）
+## 3. 用量数据来源（已选定方案 A）
 
 ### 3.1 已核实的事实（2026-11-09，本机）
 
@@ -28,7 +28,8 @@
 | Claude Code 状态栏输入 `rate_limits` | `five_hour`、`seven_day` 各有 `used_percentage`（0–100）与 `resets_at`（Unix 秒）；只对 Pro、Max 等订阅用户、且在会话第一次 API 响应之后出现 | 只在运行 statusLine 的会话里：本机实测桌面端 Code 页会话不调用 statusLine（项目级配置 2 秒刷新，约 5 分钟内零次调用） | 官方文档字段 |
 | Claude Code hook 载荷 | 没有用量字段（只有 `quota_auto_resume_*` 通知类型，不带数值） | — | 官方文档 |
 | Claude 订阅用量接口 `GET https://api.anthropic.com/api/oauth/usage` | Claude Code 的 `/usage` 使用的接口，返回 `five_hour`、`seven_day` 等窗口的用量与重置时间；鉴权用 Claude Code 存在钥匙串 `Claude Code-credentials` 里的 OAuth 访问令牌 | 与会话运行方式无关：桌面端、CLI、IDE 扩展都覆盖 | 非公开接口；字段名以实现时实测为准 |
-| Codex 会话文件 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 每轮的 `event_msg` / `token_count` 事件带 `rate_limits`：`primary`、`secondary` 各有 `used_percent`、`window_minutes`、`resets_at`（Unix 秒），另有 `plan_type` | CLI 与桌面端都写这些文件 | 非公开格式，读本机文件 |
+| Codex 会话文件 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 每轮的 `event_msg` / `token_count` 事件带 `rate_limits`：`primary`、`secondary` 各有 `used_percent`、`window_minutes`、`resets_at`（Unix 秒），另有 `plan_type`、`limit_id`（本机只见到 `codex`） | CLI 与桌面端都写这些文件 | 非公开格式，读本机文件 |
+| 钥匙串条目 `Claude Code-credentials`（实现时补查） | `claudeAiOauth` 下有 `accessToken`、`refreshToken`、`expiresAt`（Unix 毫秒）等；本机此时 `accessToken` 为空串、`expiresAt` 为 0、没有 `refreshToken`，CLI 的刷新令牌已于 11-04 过期。桌面端会话的鉴权由宿主提供（会话环境里有 `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH`），不经过这个条目 | 只有登录过的 Claude Code CLI 会写入可用令牌 | 本机实测 |
 
 两个容易踩的点：
 
@@ -101,8 +102,8 @@ y=276  后台运行 1                              上下键切换        底栏
 
 ### 4.3 资源
 
-- 两个卡片的百分比数字各需一块像素缓冲（约 72×21 RGB565，约 3 KB），优先复用专用页面上隐藏的首页缓冲（大数字、提醒条数字），不够再新增。三格计数复用首页的计数格对象与缓冲。
-- 新增 LVGL 对象约 20 个，占用 24 KB 的 LVGL 内存池。实现后用串口截屏连续截 20 次，复核主任务栈余量（当前约 2.5 KB）与空闲堆，记录在本文。
+- 两个卡片的百分比画在首页大数字缓冲（80×42）的上下两半里，各 80×21；专用页面显示时首页大数字隐藏，回到首页时重画。三格计数复用首页的计数格对象与缓冲，另加三个中文标签。没有新增像素缓冲。
+- 新增 LVGL 对象约 25 个。实测全部画面创建后 LVGL 内存池峰值 22.2 KB，原来的 24 KB 扣除分配器开销后放不下（开机即在 `LV_ASSERT_MALLOC` 处死循环，被任务看门狗卡住），改为 32 KB。池子变大后开机空闲堆的最大连续块约 28 KB，截屏原来 30 KB 的条带申请不到，条带改为 40 行（19.2 KB）。`main.c` 在编译期拦下小于 32 KB 的配置，因为已有的 `sdkconfig` 不会自动采用 `sdkconfig.defaults` 的新值。实测数据见 §8。
 - 新增中文字符（小时、用量、每周、分钟、重置、天、暂无数据、无此限额、后台运行、上下键切换等）后，用 `tools/gen_agent_run_font.sh` 重新生成字体子集。
 
 ## 5. 采集端
@@ -130,7 +131,8 @@ AR1 A t=<CC|CX> wn=<0-99> bg=<0-99> done=<0-999> h=<用量> hr=<分钟> w=<用�
 
 ### 5.3 Claude Code 用量接口的约束（选 A 时）
 
-- 令牌读取：`security find-generic-password -s "Claude Code-credentials" -w`，解析出访问令牌与过期时间；已过期就跳过本次，不刷新。
+- 令牌读取：`security find-generic-password -s "Claude Code-credentials" -w`，解析出访问令牌与过期时间；为空或已过期就跳过本次，不刷新。
+- 请求头：`Authorization: Bearer <令牌>`、`anthropic-beta: oauth-2025-04-20`、`User-Agent: agent-run/<版本>`。响应按 `five_hour`、`seven_day` 各自的 `utilization`（0–100）与 `resets_at`（ISO 8601）解析；窗口为 `null` 记为无此限额。**这组字段名尚未实测**（本机没有可用令牌，见 §8），登录 CLI 后按 P3 核对。
 - 请求：只发 GET，10 秒超时，在后台线程里执行，不阻塞守护进程主循环。
 - 限流：正常每 5 分钟一次；Claude Code 一轮结束后提前刷新，但两次请求至少间隔 60 秒；收到 401 等到令牌变化再试，收到 429 或网络错误按 5、10、20 分钟退避。
 - 令牌只在内存里用于本次请求：不写盘、不进日志、不进 `status.json`、不发给设备。日志只记录状态码与“已更新 / 失败原因”。
@@ -176,3 +178,33 @@ AR1 A t=<CC|CX> wn=<0-99> bg=<0-99> done=<0-999> h=<用量> hr=<分钟> w=<用�
 | 用量一栏按本地会话记录估算（统计 token） | 订阅限额的额度不公开，估算出的百分比没有依据 |
 | 等你处理时也允许上下键切页 | 用户要求提醒优先；需要查看专用页面时先处理提醒 |
 | 专用页面一段时间无操作自动回首页 | 用户只要求能切回首页；停留在专用页面也是一种常驻视图 |
+
+## 8. 实现记录与验收（2026-11-09）
+
+### 8.1 真机实测数据
+
+设备：AI Passport，经 USB 连接；调试固件额外每 2 秒打印栈余量与内存，验证后已刷回正式固件。
+
+| 项目 | 结果 |
+|---|---|
+| LVGL 内存池（32 KB） | 峰值已用 22,232 B，空闲 7,888 B |
+| 主任务栈（7,168 B） | 连续截屏 21 次后最低余量 2,416 B |
+| 空闲堆 | 开机后约 40.9 KB；截屏期间最低 17,040 B（条带 19.2 KB 占用期间） |
+
+### 8.2 验收结果
+
+| 编号 | 结果 |
+|---|---|
+| P1 | 宿主测试覆盖页面循环；真机上未按键实测（截图用起始页为专用页面的调试固件） |
+| P2 | 用模拟帧实测：Claude Code 页上收到等你处理后切到提醒画面，清空后回到 Claude Code 页；提示音未核对 |
+| P3 | **未验证**：本机钥匙串没有可用令牌，Claude Code 页显示“暂无数据”，`agent-run status` 显示原因 |
+| P4 | 本机真实数据：每周 5%、约 5 天后重置，5 小时一栏显示“无此限额”；未与 Codex `/status` 界面逐项对照 |
+| P5 | 守护进程测试覆盖按工具计数与 A 帧内容；真机上用模拟计数核对了显示 |
+| P6 | 测试覆盖：A 帧编码只含 §5.2 字段；令牌不进结果与日志 |
+| P7 | 宿主测试全部通过，固件构建无警告；连续截屏未溢出，数据见 §8.1 |
+| P8 | README 已补充说明与两张真机截图 |
+
+### 8.3 待用户确认
+
+- §3.2 方案 A 依赖 Claude Code CLI 的登录令牌；只用桌面端时没有数据。是否改用其他来源，或接受“需要登录 CLI”的前提，待用户决定。
+- 专用页面出现时等你处理必为 0（有等你处理时显示提醒画面），“等你处理”一格实际只在两帧之间短暂出现非零值。是否换成其他内容，待用户决定。
