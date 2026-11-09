@@ -298,6 +298,12 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(self.link().agent_lines[-1], "AR1 A t=CX wn=0 bg=0 done=1 h=x hr=- w=5 wr=6110\n")
         self.assertEqual(self.agent_frames()["CC"]["wn"], "1")
 
+    def test_agent_frames_carry_plan(self):
+        self.usage.data["codex"] = ToolUsage(NO_LIMIT, Window(5.0, self.clock.t + 6110 * 60), 990.0, None, "Pro Lite")
+        self.daemon.step()
+        self.assertEqual(self.link().agent_lines[-1], "AR1 A t=CX wn=0 bg=0 done=0 h=x hr=- w=5 wr=6110 p=Pro_Lite\n")
+        self.assertNotIn("p", self.agent_frames()["CC"])             # 没有套餐数据时不带 p
+
     def test_agent_frames_resent_only_when_content_changes(self):
         self.usage.data["claude"] = ToolUsage(Window(20.0, self.clock.t + 3600), None, 990.0, None)
         self.daemon.step()
@@ -329,7 +335,7 @@ class DaemonTest(unittest.TestCase):
 
     def test_status_file_lists_agents(self):
         resets = self.clock.t + 600
-        self.usage.data["claude"] = ToolUsage(Window(23.5, resets), None, 990.0, "用量接口返回 HTTP 429")
+        self.usage.data["claude"] = ToolUsage(Window(23.5, resets), None, 990.0, "用量接口返回 HTTP 429", "Max 5x")
         self.send({"tool": "claude", "event": "UserPromptSubmit", "sid": "c1", "ts": 1000.1})
         self.send({"tool": "claude", "event": "Stop", "sid": "c1", "ts": 1000.2, "bg": 1})
         self.daemon.step()
@@ -338,9 +344,10 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(agents["claude"], {
             "wn": 0, "bg": 1, "done": 0,
             "five_hour": {"used": 23.5, "resets_at": resets}, "seven_day": None,
-            "usage_updated": 990.0, "usage_error": "用量接口返回 HTTP 429",
+            "usage_updated": 990.0, "usage_error": "用量接口返回 HTTP 429", "plan": "Max 5x",
         })
         self.assertEqual(agents["codex"]["five_hour"], None)
+        self.assertIsNone(agents["codex"]["plan"])
 
     def test_tool_done_survives_restart(self):
         self.send({"tool": "codex", "event": "UserPromptSubmit", "sid": "x1", "ts": 1000.5})
@@ -362,6 +369,7 @@ class DaemonTest(unittest.TestCase):
         self.assertGreaterEqual(int(frames["CC"]["h"]), 80)     # 一个 ≥80% 的窗口
         self.assertEqual(frames["CX"]["h"], "x")                 # 一个“无此限额”的窗口
         self.assertNotEqual(frames["CX"]["w"], "-")
+        self.assertTrue(frames["CC"]["p"] and frames["CX"]["p"])  # 示例套餐
 
 
 class DaemonBleTest(unittest.TestCase):

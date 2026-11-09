@@ -58,8 +58,7 @@
 #define AR_TXT_RESET_DAY_FMT "%u 天 %u 小时后重置"
 #define AR_TXT_RESET_UNKNOWN "重置时间未知"
 #define AR_TXT_TILE_WORKING "工作中"
-#define AR_TXT_TILE_WAITING "等你处理"
-#define AR_TXT_BACKGROUND_FMT "后台运行 %u"
+#define AR_TXT_TILE_BACKGROUND "后台运行"
 #define AR_TXT_PAGE_HINT "上下键切换"
 
 // 工具名(等待列表)

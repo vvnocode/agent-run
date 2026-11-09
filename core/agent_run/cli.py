@@ -130,8 +130,9 @@ def cmd_status(args):
     # 专用页面的数据：按工具的计数与订阅用量
     now = time.time()
     for tool, agent in status.get("agents", {}).items():
-        print("%s：等你处理 %d · 后台运行 %d · 今日完成 %d" % (
-            names.get(tool, tool), agent["wn"], agent["bg"], agent["done"]))
+        plan = agent.get("plan")    # 套餐显示名；旧版守护进程的 status.json 没有这一项
+        print("%s%s：等你处理 %d · 后台运行 %d · 今日完成 %d" % (
+            names.get(tool, tool), "（%s）" % plan if plan else "", agent["wn"], agent["bg"], agent["done"]))
         print("  5 小时用量 %s · 每周用量 %s" % (
             describe_window(agent.get("five_hour"), now), describe_window(agent.get("seven_day"), now)))
         updated = agent.get("usage_updated")

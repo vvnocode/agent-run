@@ -205,6 +205,18 @@ static bool parse_agent_field(const char *start, const char *end, ar_agent_t *a,
     } else if (KEY_IS("wr")) {
         if (!parse_minutes(v, end, &a->wr)) return false;
         *seen |= A_WR;
+    } else if (KEY_IS("p")) {
+        // 套餐名(专用页面方案 §9):1–AR_PLAN_MAX 个字母、数字或下划线,下划线还原为空格。
+        // 可选字段,不在 seen 中置位;缺省时调用方已清零,套餐为空串
+        const size_t len = (size_t)(end - v);
+        if (len == 0 || len > AR_PLAN_MAX) return false;
+        for (size_t i = 0; i < len; i++) {
+            const char c = v[i];
+            const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+            if (!ok) return false;
+            a->plan[i] = c == '_' ? ' ' : c;
+        }
+        a->plan[len] = '\0';
     }
 #undef KEY_IS
     return true;

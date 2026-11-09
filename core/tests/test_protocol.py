@@ -49,12 +49,28 @@ class EncodeAgentTest(unittest.TestCase):
 
     NOW = 1794192000
 
-    def encode(self, tool="claude", counts=ToolCounts(wn=0, bg=0, done=0), h=None, w=None):
-        return encode_agent(tool, counts, h, w, self.NOW)
+    def encode(self, tool="claude", counts=ToolCounts(wn=0, bg=0, done=0), h=None, w=None, plan=None):
+        return encode_agent(tool, counts, h, w, self.NOW, plan)
 
     def test_matches_spec_example(self):
         line = self.encode("codex", ToolCounts(wn=0, bg=0, done=3), NO_LIMIT, Window(5.0, self.NOW + 6110 * 60))
         self.assertEqual(line, "AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110\n")
+
+    def test_plan_is_appended_with_underscores_for_spaces(self):
+        line = self.encode("codex", ToolCounts(wn=0, bg=0, done=3), NO_LIMIT, Window(5.0, self.NOW + 6110 * 60),
+                           plan="Pro Lite")
+        self.assertEqual(line, "AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110 p=Pro_Lite\n")
+        self.assertTrue(self.encode(plan="Max 20x").endswith(" wr=- p=Max_20x\n"))
+
+    def test_plan_is_sanitized_and_cut_to_ten_characters(self):
+        # 只保留字母、数字与单个空格；超过 10 个字符截断，截断处不留下划线
+        self.assertTrue(self.encode(plan="  Pro  Lite! ").endswith(" p=Pro_Lite\n"))
+        self.assertTrue(self.encode(plan="Self Serve Business Prolite").endswith(" p=Self_Serve\n"))
+        self.assertTrue(self.encode(plan="Ninechars XY").endswith(" p=Ninechars\n"))
+
+    def test_unknown_plan_is_omitted(self):
+        for plan in (None, "", "!!!"):
+            self.assertTrue(self.encode(plan=plan).endswith(" wr=-\n"), plan)
 
     def test_unknown_usage_is_dash(self):
         line = self.encode(counts=ToolCounts(wn=1, bg=2, done=4))
@@ -90,7 +106,7 @@ class EncodeAgentTest(unittest.TestCase):
 
     def test_line_never_exceeds_limit(self):
         big = Window(100.0, self.NOW + 99 * 86400)
-        line = self.encode("codex", ToolCounts(wn=99, bg=99, done=999), big, big)
+        line = self.encode("codex", ToolCounts(wn=99, bg=99, done=999), big, big, plan="W" * 200)
         self.assertLessEqual(len(line.encode("ascii")), MAX_LINE)
 
 

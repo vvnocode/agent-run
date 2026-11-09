@@ -46,6 +46,9 @@ typedef struct {
 #define AR_RESET_UNKNOWN 0xFFFFu
 #define AR_RESET_MAX_MIN 20160u
 
+// A 帧里套餐名(p 字段)的最大字符数,与主机端 protocol.MAX_PLAN_CHARS 一致
+#define AR_PLAN_MAX 10
+
 // 一个工具专用页面的数据(A 帧)
 typedef struct {
     uint8_t tool;     // AR_TOOL_CC 或 AR_TOOL_CX
@@ -56,6 +59,7 @@ typedef struct {
     uint16_t hr;      // 5 小时窗口距重置分钟数,或 AR_RESET_UNKNOWN
     uint8_t w;        // 每周窗口已用百分比,取值同 h
     uint16_t wr;      // 每周窗口距重置分钟数,取值同 hr
+    char plan[AR_PLAN_MAX + 1];   // 套餐名,如 "Pro Lite";帧里没有 p 字段时为空串
 } ar_agent_t;
 
 // 一帧完整状态
@@ -82,7 +86,8 @@ typedef enum {
 ar_line_kind_t ar_proto_parse_line(const char *line, ar_state_t *out);
 
 // 解析一行 A 帧(不含行尾)。合法时写 out 并返回 true;不是 A 帧、工具代号不是 CC / CX、
-// 任何字段缺失或越界都返回 false 且不写 out。未知键忽略。ar_proto_parse_line() 不认 A 帧,
+// 任何字段缺失或越界都返回 false 且不写 out。套餐 p 是可选字段,出现时也须合法。未知键忽略。
+// ar_proto_parse_line() 不认 A 帧,
 // 调用方在它返回 AR_LINE_IGNORED 后再试本函数。
 bool ar_proto_parse_agent(const char *line, ar_agent_t *out);
 

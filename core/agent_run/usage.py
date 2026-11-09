@@ -10,6 +10,9 @@
   rate_limits。primary / secondary 不固定对应 5 小时与每周，按 window_minutes 归类。
 - Claude Code：用钥匙串中 Claude Code 的 OAuth 访问令牌请求订阅用量接口（非公开接口）。
   令牌只在内存里用于本次请求：不写盘、不进日志、不进结果；只发 GET；绝不刷新令牌。
+
+另给出订阅类型的显示名（专用页面方案 §9）：Codex 取自同一条 token_count 事件的 plan_type，
+Claude Code 取自同一份凭据的 subscriptionType 与 rateLimitTier。
 """
 import calendar
 import hashlib
@@ -36,8 +39,8 @@ Window = namedtuple("Window", "used resets_at")
 # 账户没有这一窗口（区别于 None 表示的“暂无数据”）
 NO_LIMIT = "none"
 
-# 单个工具的用量：两个窗口、数据时间（Unix 秒）与最近一次失败原因
-ToolUsage = namedtuple("ToolUsage", "five_hour seven_day updated error")
+# 单个工具的用量：两个窗口、数据时间（Unix 秒）、最近一次失败原因与订阅类型的显示名（未知时为 None）
+ToolUsage = namedtuple("ToolUsage", "five_hour seven_day updated error plan", defaults=(None,))
 EMPTY = ToolUsage(None, None, None, None)
 
 # 窗口长度（分钟）
@@ -66,6 +69,11 @@ TOKEN_EXPIRED = "Claude Code 的登录令牌已过期，等待 Claude Code 下�
 
 _FRACTION = re.compile(r"\.(\d+)")
 
+# 订阅类型：需要特别写法的 Codex 套餐；其余套餐按原文把下划线换成空格、各词首字母大写
+CODEX_PLANS = {"prolite": "Pro Lite", "promax": "Pro Max"}
+# Claude Max 套餐的倍数写在 rateLimitTier 里，如 default_claude_max_5x
+_CLAUDE_MAX_TIER = re.compile(r"max_(\d+)x")
+
 
 def _is_number(value):
     """是否为数值（排除 bool，JSON 里的 true/false 不算数值）。"""
@@ -92,6 +100,49 @@ def _parse_time(value):
     return calendar.timegm(parsed.utctimetuple()) + parsed.microsecond / 1e6
 
 
+def _plan_label(raw, known):
+    """套餐原文换成显示名：先查 known，查不到时把下划线换成空格、各词首字母大写。
+
+    不是非空字符串时返回 None。字符清洗与长度限制由 A 帧编码负责（protocol._plan_field）。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip().lower()
+    if raw in known:
+        return known[raw]
+    return " ".join(word.capitalize() for word in raw.split("_") if word)
+
+
+def codex_plan_label(raw):
+    """Codex 会话记录里 plan_type 的显示名，如 prolite → "Pro Lite"、plus → "Plus"；没有时返回 None。"""
+    return _plan_label(raw, CODEX_PLANS)
+
+
+def claude_plan_label(text):
+    """从 Claude Code 凭据 JSON 取订阅类型的显示名，如 "Max 5x"、"Pro"；取不到时返回 None。
+
+    Max 套餐按 rateLimitTier 区分 5x 与 20x。令牌为空说明已退出登录，钥匙串里残留的套餐
+    可能是旧账号的，不使用；令牌过期仍是这次登录的账号，照常使用。
+    """
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
+        return None
+    label = _plan_label(oauth.get("subscriptionType"), {})
+    tier = oauth.get("rateLimitTier")
+    if label == "Max" and isinstance(tier, str):
+        match = _CLAUDE_MAX_TIER.search(tier)
+        if match:
+            label = "Max %sx" % match.group(1)
+    return label
+
+
 # ----------------------------------------------------------------------
 # Codex
 # ----------------------------------------------------------------------
@@ -113,7 +164,7 @@ def classify_codex_limits(rate_limits):
 
 
 def _last_codex_event(path, tail_bytes, fallback_ts):
-    """读一个会话文件的末尾，返回 (事件时间, 5 小时窗口, 每周窗口)；没有可用事件时返回 None。"""
+    """读一个会话文件的末尾，返回 (事件时间, 5 小时窗口, 每周窗口, 套餐显示名)；没有可用事件时返回 None。"""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -142,7 +193,8 @@ def _last_codex_event(path, tail_bytes, fallback_ts):
             continue
         five, seven = classify_codex_limits(limits)
         ts = _parse_time(event.get("timestamp"))
-        return (ts if ts is not None else fallback_ts), five, seven
+        # 套餐与用量取自同一条事件，两者总是一致
+        return (ts if ts is not None else fallback_ts), five, seven, codex_plan_label(limits.get("plan_type"))
     return None
 
 
@@ -174,7 +226,7 @@ def read_codex_usage(root, now, days=CODEX_RECENT_DAYS, max_files=CODEX_MAX_FILE
             best = found
     if best is None:
         return None
-    return ToolUsage(five_hour=best[1], seven_day=best[2], updated=best[0], error=None)
+    return ToolUsage(five_hour=best[1], seven_day=best[2], updated=best[0], error=None, plan=best[3])
 
 
 # ----------------------------------------------------------------------
@@ -259,6 +311,7 @@ class ClaudePoller:
         self._seven = None
         self._updated = None
         self._error = None
+        self._plan = None           # 订阅类型的显示名，每次读凭据时更新
 
     def due(self, now):
         """是否到了下次请求的时间。"""
@@ -279,6 +332,10 @@ class ClaudePoller:
             text = self._read_credentials()
         except (OSError, subprocess.SubprocessError):
             text = ""
+        # 套餐不依赖用量请求：令牌过期、不发请求时也照常更新
+        plan = claude_plan_label(text)
+        with self._lock:
+            self._plan = plan
         token, error = parse_claude_credentials(text, now)
         if token is None:
             self._wait(now, error)
@@ -319,11 +376,11 @@ class ClaudePoller:
             log.info("Claude Code 用量已更新")
 
     def result(self, now):
-        """当前结果；超过 30 分钟没有成功更新时，两个窗口都按暂无数据处理。"""
+        """当前结果；超过 30 分钟没有成功更新时，两个窗口都按暂无数据处理，套餐不受影响。"""
         with self._lock:
             fresh = self._updated is not None and now - self._updated <= CLAUDE_STALE_SECONDS
             five, seven = (self._five, self._seven) if fresh else (None, None)
-            return ToolUsage(five, seven, self._updated, self._error)
+            return ToolUsage(five, seven, self._updated, self._error, self._plan)
 
     def _wait(self, now, error):
         """不属于退避的失败（未登录、令牌过期或失效）：按正常周期再检查。"""

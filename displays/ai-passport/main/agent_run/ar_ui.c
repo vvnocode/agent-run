@@ -60,6 +60,12 @@ LV_FONT_DECLARE(ar_font_cjk14);
 #define AGENT_TITLE_Y 38
 #define PAGE_DOT 6
 #define PAGE_DOT_GAP 6
+// 第一个页码点的左边缘;套餐徽标不越过它
+#define PAGE_DOTS_X (PAD_X + CONTENT_W - AR_PAGE_COUNT * (PAGE_DOT + PAGE_DOT_GAP) + PAGE_DOT_GAP)
+// 套餐徽标(专用页面方案 §9):紧跟工具名,与工具名、页码点的间距,左右内边距,高度
+#define PLAN_CHIP_GAP 8
+#define PLAN_CHIP_PAD 7
+#define PLAN_CHIP_H 18
 #define CARD_Y0 60               // 5 小时用量卡片
 #define CARD_Y1 132              // 每周用量卡片
 #define CARD_H 64
@@ -168,6 +174,8 @@ typedef struct {
 } usage_card_t;
 static lv_obj_t *s_agent;
 static lv_obj_t *s_agent_title;
+static lv_obj_t *s_plan_chip;     // 工具名右侧的套餐徽标:轨道色圆角底块
+static lv_obj_t *s_plan_label;    // 徽标里的套餐名,强调色
 static lv_obj_t *s_page_dots[AR_PAGE_COUNT];
 static usage_card_t s_cards[2];
 // 场景
@@ -620,7 +628,7 @@ static lv_obj_t *make_group(lv_obj_t *parent) {
 // 工具专用页面:工具名、页码点、两张用量卡片(标题、百分比、进度条、距重置时间),
 // 以及首页计数格里的中文标签。在设置菜单之前创建,菜单面板叠在它上面
 static void create_agent_page(void) {
-    static const char *const tile_names[3] = { AR_TXT_TILE_WORKING, AR_TXT_TILE_WAITING, AR_TXT_DONE_TODAY };
+    static const char *const tile_names[3] = { AR_TXT_TILE_WORKING, AR_TXT_TILE_BACKGROUND, AR_TXT_DONE_TODAY };
     s_agent = make_group(s_scr);
     s_agent_title = make_label(s_agent, C_TEXT, PAD_X, AGENT_TITLE_Y);
     // 页码点靠右,三点依次为首页、Claude Code、Codex
@@ -628,6 +636,11 @@ static void create_agent_page(void) {
         const int x = PAD_X + CONTENT_W - (AR_PAGE_COUNT - i) * (PAGE_DOT + PAGE_DOT_GAP) + PAGE_DOT_GAP;
         s_page_dots[i] = make_box(s_agent, C_TRACK, x, AGENT_TITLE_Y + 5, PAGE_DOT, PAGE_DOT, PAGE_DOT / 2);
     }
+    // 套餐徽标:位置与宽度随工具名、套餐名变化,在 update_plan_chip() 里计算
+    s_plan_chip = make_box(s_agent, C_TRACK, PAD_X, AGENT_TITLE_Y, PLAN_CHIP_H, PLAN_CHIP_H, PLAN_CHIP_H / 2);
+    s_plan_label = make_label(s_plan_chip, C_ACCENT, PLAN_CHIP_PAD, 0);
+    lv_label_set_long_mode(s_plan_label, LV_LABEL_LONG_MODE_CLIP);
+    show(s_plan_chip, false);
 
     // 两张卡片的百分比画在首页大数字缓冲的上下两半:专用页面显示时首页大数字是隐藏的,
     // 回到首页时 ar_ui_update 会重画大数字,因此不必另占约 6 KB 内存
@@ -933,11 +946,37 @@ static void update_card(usage_card_t *c, uint8_t percent, uint16_t minutes) {
     lv_label_set_text(c->reset, reset);
 }
 
-// 工具专用页面:工具名、页码点、两张用量卡片,三格为工作中、等你处理、今日完成,底栏为后台运行
+// 套餐徽标:紧跟在工具名右侧,宽度随套餐名;放不下时截断文字,不压到页码点。plan 为空串时隐藏
+static void update_plan_chip(const char *plan) {
+    show(s_plan_chip, plan[0] != '\0');
+    if (plan[0] == '\0') return;
+
+    lv_obj_update_layout(s_agent_title);
+    const int title_h = lv_obj_get_height(s_agent_title);
+    const int x = PAD_X + lv_obj_get_width(s_agent_title) + PLAN_CHIP_GAP;
+    const int max_label_w = PAGE_DOTS_X - PLAN_CHIP_GAP - x - 2 * PLAN_CHIP_PAD;
+
+    // 先按内容测出文字宽度,超过可用宽度时固定宽度并截断
+    lv_obj_set_width(s_plan_label, LV_SIZE_CONTENT);
+    lv_label_set_text(s_plan_label, plan);
+    lv_obj_update_layout(s_plan_label);
+    int label_w = lv_obj_get_width(s_plan_label);
+    if (label_w > max_label_w) {
+        label_w = max_label_w;
+        lv_obj_set_width(s_plan_label, label_w);
+    }
+    lv_obj_set_pos(s_plan_label, PLAN_CHIP_PAD, (PLAN_CHIP_H - lv_obj_get_height(s_plan_label)) / 2);
+    lv_obj_set_size(s_plan_chip, label_w + 2 * PLAN_CHIP_PAD, PLAN_CHIP_H);
+    lv_obj_set_pos(s_plan_chip, x, AGENT_TITLE_Y + (title_h - PLAN_CHIP_H) / 2);
+}
+
+// 工具专用页面:工具名与套餐徽标、页码点、两张用量卡片,三格为工作中、后台运行、今日完成,底栏只有切换提示。
+// 不显示“等你处理”:有会话等你处理时调用方显示提醒画面,专用页面出现时这个数必为 0
 static void update_agent_page(const ar_view_t *v) {
     const bool cc = v->page == AR_PAGE_CC;
     const ar_agent_t *a = &v->agent;
     lv_label_set_text(s_agent_title, cc ? AR_TXT_TOOL_CC : AR_TXT_TOOL_CX);
+    update_plan_chip(v->has_agent ? a->plan : "");   // 还没收到 A 帧时不显示套餐
     for (int i = 0; i < AR_PAGE_COUNT; i++) {
         lv_obj_set_style_bg_color(s_page_dots[i], lv_color_hex(i == v->page ? C_ACCENT : C_TRACK), LV_PART_MAIN);
     }
@@ -947,12 +986,10 @@ static void update_agent_page(const ar_view_t *v) {
 
     // 工作中沿用状态帧的 cc / cx(含后台运行);刚有会话完成时“今日完成”用强调色
     draw_agent_tile(0, cc ? v->state.cc : v->state.cx, C_TEXT);
-    draw_agent_tile(1, v->has_agent ? a->wn : 0, C_ALERT);
+    draw_agent_tile(1, v->has_agent ? a->bg : 0, C_TEXT);
     draw_agent_tile(2, v->has_agent ? a->done : 0, v->agent_flash ? C_ACCENT : C_TEXT);
     lv_obj_set_style_text_color(s_tile_label[2], lv_color_hex(v->agent_flash ? C_ACCENT : C_TEXT2), LV_PART_MAIN);
 
-    lv_obj_set_style_text_color(s_done_label, lv_color_hex(C_TEXT2), LV_PART_MAIN);
-    lv_label_set_text_fmt(s_done_label, AR_TXT_BACKGROUND_FMT, (unsigned)(v->has_agent ? a->bg : 0));
     lv_label_set_text(s_wait_short_label, AR_TXT_PAGE_HINT);
     align_right(s_wait_short_label, PAD_X + CONTENT_W - 6, 276);
 }
@@ -992,7 +1029,7 @@ void ar_ui_update(const ar_view_t *v) {
         lv_obj_set_y(s_tiles[i], agent_page ? TILE_Y_AGENT : TILE_Y);
     }
     show(s_agent, show_agent);
-    show(s_done_label, show_normal || show_agent);
+    show(s_done_label, show_normal);   // 专用页面底栏左侧留空,后台运行已移到中间一格
     show(s_wait_short_label, show_normal || show_agent);
     show(s_alert, show_waiting);
     show(s_list, show_waiting);

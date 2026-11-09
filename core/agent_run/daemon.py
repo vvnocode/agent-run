@@ -50,11 +50,11 @@ DEMO_SCREENS = [
 # 有专用页面的工具，按设备上的页面顺序（专用页面方案 §4.1）
 AGENT_TOOLS = ("claude", "codex")
 
-# 演示模式下专用页面的示例数据：(计数, 5 小时窗口, 每周窗口)，窗口为 (已用百分比, 距重置秒数)。
+# 演示模式下专用页面的示例数据：(计数, 5 小时窗口, 每周窗口, 套餐)，窗口为 (已用百分比, 距重置秒数)。
 # 含一个 ≥80% 的窗口（进度条变橙色）和一个“无此限额”的窗口（专用页面方案 §5.5）
 DEMO_AGENTS = {
-    "claude": (ToolCounts(wn=1, bg=1, done=8), (86.0, 2 * 3600 + 15 * 60), (41.0, 3 * 86400 + 5 * 3600)),
-    "codex": (ToolCounts(wn=1, bg=0, done=13), NO_LIMIT, (23.0, 6 * 86400 + 2 * 3600)),
+    "claude": (ToolCounts(wn=1, bg=1, done=8), (86.0, 2 * 3600 + 15 * 60), (41.0, 3 * 86400 + 5 * 3600), "Max 5x"),
+    "codex": (ToolCounts(wn=1, bg=0, done=13), NO_LIMIT, (23.0, 6 * 86400 + 2 * 3600), "Pro Lite"),
 }
 
 # 每轮最多处理的数据报数，防止事件风暴饿死链路维护
@@ -366,19 +366,20 @@ class Daemon:
             self._next_retry = now + RETRY_SECONDS
 
     def _agent_values(self, tool, counts, now):
-        """返回某个工具 A 帧的 (计数, 5 小时窗口, 每周窗口)；演示模式下用示例数据。"""
+        """返回某个工具 A 帧的 (计数, 5 小时窗口, 每周窗口, 套餐)；演示模式下用示例数据。"""
         if self._demo_start is not None:
-            demo_counts, five, seven = DEMO_AGENTS[tool]
+            demo_counts, five, seven, plan = DEMO_AGENTS[tool]
             to_window = lambda w: w if w == NO_LIMIT else Window(w[0], now + w[1])
-            return demo_counts, to_window(five), to_window(seven)
+            return demo_counts, to_window(five), to_window(seven), plan
         usage = self._usage.get(tool)
-        return counts[tool], usage.five_hour, usage.seven_day
+        return counts[tool], usage.five_hour, usage.seven_day, usage.plan
 
     def _send_agents(self, now):
         """按工具发送 A 帧：内容变化时才发（距重置分钟数每分钟变一次），不随心跳重发。"""
         counts = self._agg.tool_counts()
         for tool in AGENT_TOOLS:
-            line = encode_agent(tool, *self._agent_values(tool, counts, now), now)
+            tool_counts, five, seven, plan = self._agent_values(tool, counts, now)
+            line = encode_agent(tool, tool_counts, five, seven, now, plan)
             if line == self._last_agent.get(tool):
                 continue
             if not self._link.write_line(line):
@@ -422,7 +423,7 @@ class Daemon:
         _write_json_atomic(self.status_path, dict(status, updated=now))
 
     def _agents_status(self):
-        """status.json 的 agents 部分：每个工具的计数、用量、数据时间与最近一次失败原因。"""
+        """status.json 的 agents 部分：每个工具的计数、用量、数据时间、最近一次失败原因与套餐。"""
         counts = self._agg.tool_counts()
         agents = {}
         for tool in AGENT_TOOLS:
@@ -435,6 +436,7 @@ class Daemon:
                 "seven_day": _window_json(usage.seven_day),
                 "usage_updated": usage.updated,
                 "usage_error": usage.error,
+                "plan": usage.plan,      # 套餐显示名，未知时为 None
             }
         return agents
 

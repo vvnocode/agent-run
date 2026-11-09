@@ -13,7 +13,9 @@ from agent_run.usage import (
     ClaudePoller,
     UsageCollector,
     Window,
+    claude_plan_label,
     classify_codex_limits,
+    codex_plan_label,
     parse_claude_credentials,
     parse_claude_usage,
     read_codex_usage,
@@ -23,16 +25,17 @@ NOW = 1794192000.0
 TOKEN = "sk-ant-oat01-NEVER-LEAK-THIS"
 
 
-def token_count(ts, primary=None, secondary=None, limit_id="codex", rate_limits=True):
-    """构造一行与 Codex 会话文件格式一致的 token_count 事件。"""
+def token_count(ts, primary=None, secondary=None, limit_id="codex", rate_limits=True, plan_type="prolite"):
+    """构造一行与 Codex 会话文件格式一致的 token_count 事件；plan_type 为 None 时不写这个键。"""
     payload = {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1}}}
     if rate_limits:
         payload["rate_limits"] = {
             "limit_id": limit_id,
             "primary": primary,
             "secondary": secondary,
-            "plan_type": "prolite",
         }
+        if plan_type is not None:
+            payload["rate_limits"]["plan_type"] = plan_type
     else:
         payload["rate_limits"] = None
     return json.dumps({"timestamp": ts, "type": "event_msg", "payload": payload}) + "\n"
@@ -87,6 +90,16 @@ class ReadCodexTest(unittest.TestCase):
         self.assertEqual((usage.five_hour, usage.seven_day), (NO_LIMIT, Window(5.0, 1794632374)))
         self.assertAlmostEqual(usage.updated, 1794186263.679, places=2)
         self.assertIsNone(usage.error)
+        self.assertEqual(usage.plan, "Pro Lite")
+
+    def test_plan_comes_from_the_same_event(self):
+        # 套餐取自用量所在的那条事件；没有 plan_type 时为 None，用量照常
+        self.write("rollout-a.jsonl",
+                   token_count("2026-11-09T01:00:00.000Z", WEEK, plan_type="plus")
+                   + token_count("2026-11-09T01:01:00.000Z", WEEK, plan_type=None))
+        usage = read_codex_usage(self.root, NOW)
+        self.assertEqual(usage.seven_day, Window(5.0, 1794632374))
+        self.assertIsNone(usage.plan)
 
     def test_events_without_rate_limits_or_other_limit_ids_are_skipped(self):
         self.write("rollout-a.jsonl",
@@ -150,6 +163,47 @@ class ClaudeParseTest(unittest.TestCase):
             parse_claude_usage([])
 
 
+class PlanLabelTest(unittest.TestCase):
+    """订阅类型的显示名（专用页面方案 §9）。"""
+
+    def creds(self, **oauth):
+        oauth.setdefault("accessToken", TOKEN)
+        return json.dumps({"claudeAiOauth": oauth})
+
+    def test_claude_plans(self):
+        cases = [
+            ({"subscriptionType": "max", "rateLimitTier": "default_claude_max_5x"}, "Max 5x"),
+            ({"subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}, "Max 20x"),
+            ({"subscriptionType": "max"}, "Max"),
+            ({"subscriptionType": "pro", "rateLimitTier": "default_claude_pro"}, "Pro"),
+            ({"subscriptionType": "team"}, "Team"),
+            ({"subscriptionType": "enterprise"}, "Enterprise"),
+            ({"subscriptionType": "free"}, "Free"),
+            ({"subscriptionType": "ultra_plus"}, "Ultra Plus"),     # 没见过的套餐按原文首字母大写
+        ]
+        for oauth, label in cases:
+            self.assertEqual(claude_plan_label(self.creds(**oauth)), label, oauth)
+
+    def test_claude_plan_needs_a_login(self):
+        # 过期的令牌说明仍是这次登录的账号，套餐照常显示；令牌为空（已退出登录）时钥匙串里的套餐可能是旧的
+        expired = self.creds(subscriptionType="pro", expiresAt=0)
+        self.assertEqual(claude_plan_label(expired), "Pro")
+        for text in (self.creds(subscriptionType="max", accessToken=""), self.creds(),
+                     self.creds(subscriptionType=""), "{}", "not json", ""):
+            self.assertIsNone(claude_plan_label(text), text)
+
+    def test_codex_plans(self):
+        cases = {"free": "Free", "go": "Go", "plus": "Plus", "pro": "Pro", "prolite": "Pro Lite",
+                 "promax": "Pro Max", "team": "Team", "business": "Business", "enterprise": "Enterprise",
+                 "edu": "Edu", "edu_plus": "Edu Plus"}
+        for raw, label in cases.items():
+            self.assertEqual(codex_plan_label(raw), label, raw)
+
+    def test_codex_plan_missing(self):
+        for raw in (None, "", 3):
+            self.assertIsNone(codex_plan_label(raw))
+
+
 class FakeClaude:
     """可编排的凭据与请求结果；记录发出的请求次数与使用的令牌。"""
 
@@ -159,7 +213,10 @@ class FakeClaude:
         self.requests = []
 
     def read_credentials(self):
-        return json.dumps({"claudeAiOauth": {"accessToken": self.token, "expiresAt": (NOW + 86400) * 1000}})
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": self.token, "expiresAt": (NOW + 86400) * 1000,
+            "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x",
+        }})
 
     def fetch(self, token):
         self.requests.append(token)
@@ -185,6 +242,7 @@ class ClaudePollerTest(unittest.TestCase):
         usage = self.poller.result(NOW)
         self.assertEqual((usage.five_hour, usage.seven_day), (Window(23.0, None), Window(41.0, None)))
         self.assertEqual(usage.updated, NOW)
+        self.assertEqual(usage.plan, "Max 5x")
         self.assertFalse(self.poller.due(NOW + 299))
         self.assertTrue(self.poller.due(NOW + 300))
 
@@ -203,6 +261,15 @@ class ClaudePollerTest(unittest.TestCase):
         self.assertEqual(self.fake.requests, [])
         self.assertIn("过期", self.poller.result(NOW).error)
         self.assertTrue(self.poller.due(NOW + 300))
+
+    def test_plan_is_read_even_without_a_request(self):
+        # 令牌过期时不发请求，但套餐照常从凭据里读出
+        creds = {"accessToken": TOKEN, "expiresAt": 0, "subscriptionType": "pro"}
+        self.poller = ClaudePoller(read_credentials=lambda: json.dumps({"claudeAiOauth": creds}),
+                                   fetch=self.fake.fetch)
+        self.poller.poll(NOW)
+        self.assertEqual(self.poller.result(NOW).plan, "Pro")
+        self.assertEqual(self.fake.requests, [])
 
     def test_unauthorized_waits_for_a_new_token(self):
         self.fake.responses = [(401, b""), (200, OK_BODY)]
