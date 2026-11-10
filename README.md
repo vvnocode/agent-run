@@ -32,8 +32,26 @@ Agent Run! 把本机正在运行的 AI 编程 Agent 会话（Claude Code、Codex
   </p>
 
 - **省电：** 屏幕在通知或按键后亮起，空闲时自动调暗、熄屏，长按确定键可以立即熄屏。电池供电和接电脑时的熄屏时间分别可设；标题栏显示电量百分比。
-- **勿扰：** 在设置里手动开启，或开启夜间勿扰（每天 22:00–08:00 自动生效）。勿扰期间不响铃，通知不点亮屏幕，标题栏显示月牙。夜间时段按电脑的本地时间判断。
+
+  <p align="center">
+    <img src="docs/images/screen-menu-battery-off.png" width="160" alt="电池熄屏：10 秒到 3 分四档">
+    <img src="docs/images/screen-menu-usb-off.png" width="160" alt="接电脑熄屏：5 分到不熄屏五档">
+  </p>
+
+- **勿扰：** 在设置里手动开启，或开启夜间勿扰（每天 22:00–08:00 自动生效）。勿扰期间不响铃，通知不点亮屏幕，标题栏显示月牙；手动勿扰和夜间勿扰任一生效都会显示月牙，所以夜间时段关掉手动勿扰，月牙仍在。夜间时段按电脑的本地时间判断。
+
+  <p align="center">
+    <img src="docs/images/screen-dnd.png" width="160" alt="勿扰生效时，标题栏喇叭左侧显示月牙">
+    <img src="docs/images/screen-menu-dnd.png" width="160" alt="勿扰：手动开启或关闭">
+    <img src="docs/images/screen-menu-night.png" width="160" alt="夜间勿扰：每天 22:00–08:00，夜间时段显示现在生效中">
+  </p>
+
 - **设置菜单：** 按确定键打开，可以调音量、亮度、电池熄屏、接电脑熄屏、勿扰、夜间勿扰，调节结果断电保存。
+
+  <p align="center">
+    <img src="docs/images/screen-menu.png" width="160" alt="设置菜单：六项设置及当前取值">
+  </p>
+
 - **两种连接：** 插着 USB 时走 USB；拔掉后自动改走蓝牙，插回自动切回。
 - **隐私：** 发给设备的只有计数、工具代号、原因代号和用量百分比，不含账号、项目名、路径、提示词或会话内容。
 
