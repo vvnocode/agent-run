@@ -2,6 +2,7 @@
 #include "ar_model.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "ar_text.h"
 
@@ -330,17 +331,115 @@ bool ar_keywake_action(ar_keywake_t *k) {
     return true;
 }
 
-void ar_power_init(ar_power_t *p) {
-    p->known = false;
-    p->on_usb = false;
+void ar_extpower_init(ar_extpower_t *p) {
+    memset(p, 0, sizeof(*p));
+    p->state = AR_PWR_BATTERY;
+    p->peak_soc = -1;
 }
 
-bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on) {
-    const bool unplugged = p->known && p->on_usb && !on_usb;
+// 只留最近两点作为新基准:判定刚改变时,之前的点还在跳变另一侧,留着会让同一次跳变再触发一次
+static void extpower_rebase(ar_extpower_t *p) {
+    if (p->n <= 2) return;
+    p->mv[0] = p->mv[p->n - 2];
+    p->mv[1] = p->mv[p->n - 1];
+    p->n = 2;
+}
+
+// 改判定:进入新状态并重置基准。改判电池供电时清掉电量最高值,下次接上重新记录
+static void extpower_set(ar_extpower_t *p, ar_pwr_state_t state, int soc) {
+    p->state = (uint8_t)state;
+    p->peak_soc = state == AR_PWR_BATTERY || soc < 0 ? -1 : (int8_t)soc;
+    extpower_rebase(p);
+}
+
+// 按最近两点与之前的基准判断插拔。至少要有 6 点:最近两点 + 4 点基准
+static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
+    const int n = p->n;
+    const int a = p->mv[n - 1];
+    const int b = p->mv[n - 2];
+    const int lo = a < b ? a : b;
+    const int hi = a > b ? a : b;
+
+    // 电池单独供电达不到恒压段的电压:开机时已在恒压充电,或插上的跳变被负载变化盖过时,靠它补上
+    if (p->state == AR_PWR_BATTERY && lo >= AR_PWR_CV_MV) {
+        extpower_set(p, AR_PWR_CHARGING, soc);
+        return;
+    }
+    if (n < 6) return;
+
+    // 插上的基准取之前 6 秒的最高值:负载下陷后回升只回到原电平,不会超过下陷前的最高值
+    int base_max = p->mv[0];
+    for (int i = 1; i < n - 2; i++) {
+        if (p->mv[i] > base_max) base_max = p->mv[i];
+    }
+    if (lo >= base_max + AR_PWR_STEP_MV) {
+        if (p->state != AR_PWR_CHARGING) extpower_set(p, AR_PWR_CHARGING, soc);
+        return;
+    }
+
+    // 拔掉的基准取之前 2 秒(4 点)的中位数,不受单点毛刺影响
+    int s[4];
+    for (int i = 0; i < 4; i++) s[i] = p->mv[n - 6 + i];
+    for (int i = 1; i < 4; i++) {   // 4 个数的插入排序
+        const int v = s[i];
+        int j = i - 1;
+        while (j >= 0 && s[j] > v) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = v;
+    }
+    const int base_med = (s[1] + s[2]) / 2;
+    if (hi + AR_PWR_STEP_MV > base_med) return;
+    // 电池供电时的下陷是负载引起的:不改判定,也不重置基准
+    if (p->state == AR_PWR_BATTERY) return;
+    const int drop = base_med - (a + b) / 2;
+    if (base_med >= AR_PWR_CV_MV && drop < AR_PWR_TERM_MAX_MV) {
+        // 恒压段充满停充:充电电流没了,负载仍由充电器带
+        extpower_set(p, AR_PWR_IDLE, soc);
+    } else if (usb_host) {
+        // USB 主机在线时一定接着电源,降幅只能是充电电流变化
+        extpower_set(p, AR_PWR_IDLE, soc);
+    } else {
+        extpower_set(p, AR_PWR_BATTERY, soc);
+    }
+}
+
+bool ar_extpower_update(ar_extpower_t *p, int mv, int soc, bool usb_host, ar_load_t load) {
+    if (mv > 0 && load != AR_LOAD_TRANSIENT) {
+        if (load == AR_LOAD_CHANGED) p->n = 0;   // 自身负载变了:旧基准不可比
+        if (p->n == AR_PWR_HISTORY) {
+            memmove(p->mv, p->mv + 1, sizeof(p->mv[0]) * (AR_PWR_HISTORY - 1));
+            p->n--;
+        }
+        p->mv[p->n++] = (int16_t)mv;
+        if (p->n >= 2) extpower_detect(p, soc, usb_host);
+    }
+
+    if (usb_host) {
+        // USB 主机在线:一定接着电源。电量最高值跟着当前读数走,离线后兜底从离线那一刻算起
+        if (p->state == AR_PWR_BATTERY) p->state = AR_PWR_IDLE;
+        if (soc >= 0) p->peak_soc = (int8_t)soc;
+    } else if (p->state != AR_PWR_BATTERY && soc >= 0) {
+        // 兜底:接着电源时电量不会往下掉;掉了说明拔线没识别出来,其实在耗电池
+        if (p->peak_soc < 0 || soc > p->peak_soc) p->peak_soc = (int8_t)soc;
+        else if (soc + AR_PWR_SOC_FALL <= p->peak_soc) extpower_set(p, AR_PWR_BATTERY, soc);
+    }
+    return usb_host || p->state != AR_PWR_BATTERY;
+}
+
+void ar_power_init(ar_power_t *p) {
+    p->known = false;
+    p->on_power = false;
+}
+
+bool ar_power_update(ar_power_t *p, bool on_power, bool screen_on) {
+    const bool plugged = p->known && !p->on_power && on_power;
+    const bool unplugged = p->known && p->on_power && !on_power;
     p->known = true;
-    p->on_usb = on_usb;
-    // 只在“拔线时屏幕亮着”这一种情况补记亮屏事件,让屏幕按电池规则继续亮一段时间
-    return unplugged && screen_on;
+    p->on_power = on_power;
+    // 接上电源一律点亮;断开时只在屏幕亮着时补记,让屏幕按电池规则继续亮一段时间
+    return plugged || (unplugged && screen_on);
 }
 
 bool ar_lock_allowed(bool menu_open, bool pairing) {
@@ -351,7 +450,7 @@ uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in) {
     if (in->locked) return 0;
     const uint8_t normal = ar_brightness_percent(in->level);
     const uint8_t dim = normal < AR_DIM_PERCENT ? normal : AR_DIM_PERCENT;   // 只降不升
-    if (!in->on_usb_power) return in->ms_since_wake < ar_battery_off_ms(in->battery_off) ? dim : 0;
+    if (!in->on_power) return in->ms_since_wake < ar_battery_off_ms(in->battery_off) ? dim : 0;
     if (in->screen == AR_SCREEN_DISCONNECTED && in->ms_disconnected >= AR_BACKLIGHT_IDLE_MS &&
         in->ms_since_wake >= AR_BACKLIGHT_IDLE_MS) {
         return 0;
@@ -365,8 +464,8 @@ uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in) {
 }
 
 bool ar_model_should_deep_sleep(const ar_sleep_in_t *in) {
-    // 有 USB 主机、可能没装电池、正在配对时一律不睡
-    if (in->on_usb_power || !in->battery_present || in->confirming) return false;
+    // 接着电源、可能没装电池、正在配对时一律不睡
+    if (in->on_power || !in->battery_present || in->confirming) return false;
     // 熄屏满 1 小时即关机,在线时也一样(亮屏期间 ms_dark 为 0)
     if (in->ms_dark >= AR_POWER_OFF_AFTER_DARK_MS) return true;
     // 在线时 ms_disconnected 为 0,自然不满足

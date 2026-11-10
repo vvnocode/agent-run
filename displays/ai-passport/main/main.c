@@ -12,7 +12,7 @@
 //          确定 单击  打开设置菜单(一级:音量、亮度,默认选中音量)
 //          下 / 上    依次切换 首页 → Claude Code → Codex → 首页(上键反向),见 ar_page_step();
 //                     等你处理、未连接时不切页,这两种画面优先显示,清空后回到所在页面
-//   一级   上 / 下    切换选中项(音量、亮度、电池熄屏、接电脑熄屏、勿扰、夜间勿扰);
+//   一级   上 / 下    切换选中项(音量、亮度、电池熄屏、接电源熄屏、勿扰、夜间勿扰);
 //                     确定单击进入二级;确定双击回首页;10 秒无按键回首页
 //   二级   上 / 下    调节并保存(调音量时按新音量试听,调亮度时按设定亮度点亮;
 //                     勿扰与夜间勿扰上键开启、下键关闭);确定双击回一级;3 秒无按键回首页
@@ -22,13 +22,14 @@
 //   任意键           背光关闭时按下即亮屏,这次手势不执行按键操作;深睡时唤醒设备(重新启动)
 //
 // 亮屏与熄屏:按键、通知(等你处理增加、有会话完成、等你处理 3 分钟未处理的再提醒)、
-// 连上电脑、配对确认都会点亮屏幕,之后按供电方式与熄屏时间设置调暗、熄屏,
-// 规则见 ar_model_backlight_percent()。拔掉 USB 时屏幕若亮着,也算一次亮屏事件,
-// 见 ar_power_update()。
+// 连上电脑、接上电源、配对确认都会点亮屏幕,之后按供电方式与熄屏时间设置调暗、熄屏,
+// 规则见 ar_model_backlight_percent()。断开电源时屏幕若亮着,也算一次亮屏事件,
+// 见 ar_power_update()。是否接着电源:USB 主机在线,或按电池电压推断接着充电器,
+// 见 ar_extpower_update() 与供电方案(-power-detect-design.md)。
 // 电池供电时,“未连接”且无按键满 30 分钟,或熄屏满 1 小时,进入深睡(关机,按任意键唤醒),
 // 规则见 ar_model_should_deep_sleep()。
 // 勿扰(手动开启,或夜间勿扰开启且主机同步的本地时间在 22:00–08:00)生效时不响任何提示音,
-// 通知与连上电脑不点亮屏幕,规则见 ar_dnd_active() 与屏幕方案 §6。
+// 通知与连上电脑不点亮屏幕(接上电源仍点亮),规则见 ar_dnd_active() 与屏幕方案 §6。
 #include <string.h>
 
 #include "agent_run/ar_ble.h"
@@ -75,6 +76,10 @@ static const char *TAG = "agent_run";
 #define LVGL_LOCK_TIMEOUT_MS 200
 #define CLEAR_BOND_HOLD_US (5LL * 1000 * 1000)     // 按住上键这么久清除配对
 #define CLEARED_NOTICE_US (3LL * 1000 * 1000)      // “已清除配对”提示的显示时长
+// 提示音最长 180 ms,期间电池电压短暂下陷;开始播放后这么久内的采样不用于供电推断
+#define SOUND_SETTLE_US (1000LL * 1000)
+// 背光改变后这么多个采样点按负载变化处理:电量计的读数可能要一个采样点后才反映新负载
+#define BACKLIGHT_SETTLE_SAMPLES 2
 
 typedef struct {
     bsp_btn_t btn;
@@ -102,7 +107,7 @@ static ar_notice_t s_notice;
 static ar_chime_t s_chime;
 static ar_remind_t s_remind;                // 等你处理长时间未处理的再提醒
 static uint8_t s_battery_off;               // 电池供电的熄屏时间选项
-static uint8_t s_usb_off;                   // 接电脑的熄屏时间选项
+static uint8_t s_usb_off;                   // 接电源的熄屏时间选项
 static bool s_locked;                       // 用户长按确定键手动熄屏,到下一次亮屏事件为止
 static bool s_dnd;                          // 勿扰(手动)开关
 static bool s_night;                        // 夜间勿扰开关
@@ -111,7 +116,10 @@ static uint16_t s_done_flash_count;         // “完成 +N”里的 N,提示期
 static ar_menu_t s_menu;                    // 设置菜单的层级与选中项
 static int64_t s_done_flash_until_us;       // “完成 +N”提示的截止时刻
 static ar_keywake_t s_keywake;              // 熄屏时按键亮屏,并吞掉这次手势的动作
-static ar_power_t s_power;                  // 供电方式,拔掉 USB 时据此补记亮屏事件
+static ar_power_t s_power;                  // 供电方式,接上与断开电源时据此补记亮屏事件
+static ar_extpower_t s_extpower;            // 按电池电压推断是否接着充电器
+static bool s_on_extpower;                  // 上一次推断的结果(含 USB 主机在线)
+static int64_t s_sound_us;                  // 最近一次开始播放提示音的时刻,0 表示还没响过
 static int64_t s_dark_since_us;             // 屏幕熄灭的时刻,亮着时为 0
 static uint8_t s_page = AR_PAGE_HOME;       // 用户所在页面(ar_page_t);熄屏不变,重启回首页
 static ar_screen_t s_screen = AR_SCREEN_DISCONNECTED;   // 上一轮选出的画面,按键处理据此判断能否切页
@@ -131,6 +139,13 @@ static uint32_t ms_since(int64_t from_us, int64_t now_us) {
 static void wake(int64_t now_us) {
     s_last_wake_us = now_us;
     s_locked = false;
+}
+
+// 播放提示音并记下开始时刻:播放期间电池电压会短暂下陷,供电推断要跳过这段时间的采样
+static void play_sound(ar_chime_kind_t kind) {
+    if (kind == AR_CHIME_NONE) return;
+    ar_sound_play(kind, ar_volume_percent(s_volume));
+    s_sound_us = esp_timer_get_time();
 }
 
 // 按键回调运行在共享的 esp_timer 任务里:只入队,立刻返回
@@ -153,7 +168,7 @@ static void apply_adjust(uint8_t item, int delta) {
             ar_settings_save_volume(s_volume);
             ESP_LOGI(TAG, "音量 %u 档", (unsigned)s_volume);
         }
-        ar_sound_play(AR_CHIME_WAITING, ar_volume_percent(s_volume));
+        play_sound(AR_CHIME_WAITING);
     } else if (item == AR_MENU_BRIGHTNESS) {
         const uint8_t brightness = ar_brightness_step(s_brightness, delta);
         if (brightness != s_brightness) {
@@ -307,6 +322,9 @@ static void app_task(void *arg) {
     int64_t next_frame_us = 0;
     int64_t next_battery_us = 0;
     int64_t next_heap_us = 0;
+    int64_t next_power_us = 0;     // 下一次供电推断采样的时刻
+    uint8_t power_bl = 0xFF;       // 上一次采样时的背光,用来识别背光变化
+    uint8_t power_settle = 0;      // 还要按负载变化处理的采样点数
     uint16_t last_seq = 0;
     bool had_frame = false;
     bool was_alive = false;        // 上一轮链路是否在线,用于识别连上与掉线
@@ -369,7 +387,7 @@ static void app_task(void *arg) {
             fresh_waiting = ev.waiting;
             if ((ev.waiting || ev.completed > 0) && !dnd) wake(now);
             const ar_chime_kind_t kind = ar_chime_pick(&s_chime, ev, now_ms, muted);
-            ar_sound_play(kind, ar_volume_percent(s_volume));
+            play_sound(kind);
             if (ev.completed > 0) {
                 s_done_flash_count = now < s_done_flash_until_us ? (uint16_t)(s_done_flash_count + ev.completed)
                                                                  : ev.completed;
@@ -382,7 +400,7 @@ static void app_task(void *arg) {
             if (!dnd) wake(now);
             const ar_notice_ev_t again = { .waiting = true, .completed = 0 };
             const ar_chime_kind_t kind = ar_chime_pick(&s_chime, again, now_ms, muted);
-            ar_sound_play(kind, ar_volume_percent(s_volume));
+            play_sound(kind);
             ESP_LOGI(TAG, "等你处理未处理,第 %u 次再提醒%s", (unsigned)s_remind.count, dnd ? "(勿扰中,不亮屏不响)" : "");
         }
 
@@ -402,13 +420,37 @@ static void app_task(void *arg) {
         } else {
             s_disconnected_since_us = 0;
         }
-        // 拔掉 USB 时屏幕若亮着,补记一次亮屏事件:否则按电池规则(亮屏事件后默认 30 秒)
-        // 计时早已超时,亮着的屏幕会在拔线瞬间熄灭
-        const bool on_usb = usb_serial_jtag_is_connected();
-        if (ar_power_update(&s_power, on_usb, s_backlight > 0)) wake(now);
+        // 供电:USB 主机在线时一定接着电源;此外每 AR_PWR_SAMPLE_MS 读一次电池电压,推断是否接着
+        // 充电器。背光改变后的几个点按负载变化处理,提示音刚响过的点不计入,免得设备自己的负载被当成插拔
+        const bool usb_host = usb_serial_jtag_is_connected();
+        if (now >= next_power_us) {
+            if (s_backlight != power_bl) {
+                power_bl = s_backlight;
+                power_settle = BACKLIGHT_SETTLE_SAMPLES;
+            }
+            ar_load_t load = AR_LOAD_STEADY;
+            if (s_sound_us && now - s_sound_us < SOUND_SETTLE_US) {
+                load = AR_LOAD_TRANSIENT;
+            } else if (power_settle > 0) {
+                load = AR_LOAD_CHANGED;
+                power_settle--;
+            }
+            const int mv = bsp_battery_mv();
+            const bool on_extpower = ar_extpower_update(&s_extpower, mv, bsp_battery_soc(), usb_host, load);
+            if (on_extpower != s_on_extpower) {
+                ESP_LOGI(TAG, "%s:电池 %d mV,USB 主机%s,判定状态 %u", on_extpower ? "接上电源" : "断开电源", mv,
+                         usb_host ? "在线" : "离线", (unsigned)s_extpower.state);
+                s_on_extpower = on_extpower;
+            }
+            next_power_us = now + (int64_t)AR_PWR_SAMPLE_MS * 1000;
+        }
+        const bool on_power = usb_host || s_on_extpower;
+        // 接上电源一律点亮屏幕(熄屏、手动熄屏、勿扰时都亮);断开时屏幕若亮着补记一次亮屏事件,
+        // 否则按电池规则(亮屏事件后默认 30 秒)计时早已超时,亮着的屏幕会在断电瞬间熄灭
+        if (ar_power_update(&s_power, on_power, s_backlight > 0)) wake(now);
         const ar_backlight_in_t bl_in = {
             .screen = screen,
-            .on_usb_power = on_usb,
+            .on_power = on_power,
             .level = s_brightness,
             .ms_since_wake = ms_since(s_last_wake_us, now),
             .ms_disconnected = s_disconnected_since_us ? ms_since(s_disconnected_since_us, now) : 0,
@@ -433,7 +475,7 @@ static void app_task(void *arg) {
 
         // 深睡:电池供电且长时间未连接,或熄屏满 1 小时。电量计读不到时可能没装电池,不睡
         const ar_sleep_in_t sleep_in = {
-            .on_usb_power = bl_in.on_usb_power,
+            .on_power = bl_in.on_power,
             .battery_present = s_battery >= 0,
             .confirming = ble.confirming,
             .ms_disconnected = bl_in.ms_disconnected,
@@ -540,6 +582,7 @@ void app_main(void) {
     ar_remind_init(&s_remind);
     ar_keywake_init(&s_keywake);
     ar_power_init(&s_power);
+    ar_extpower_init(&s_extpower);
     for (int i = 0; i < AR_AGENT_TOOLS; i++) ar_notice_init(&s_agent_notice[i]);
 
     if (bsp_audio_init() == ESP_OK) {

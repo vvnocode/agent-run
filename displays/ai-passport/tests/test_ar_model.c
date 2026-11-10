@@ -152,10 +152,10 @@ static void test_menu_timeouts(void) {
 }
 
 // 背光计算的默认输入:亮度第 3 档,刚发生过亮屏事件,在线
-static ar_backlight_in_t backlight_in(ar_screen_t screen, bool usb_power) {
+static ar_backlight_in_t backlight_in(ar_screen_t screen, bool power) {
     ar_backlight_in_t in = {
         .screen = screen,
-        .on_usb_power = usb_power,
+        .on_power = power,
         .level = 3,
         .ms_since_wake = 0,
         .ms_disconnected = 0,
@@ -166,8 +166,8 @@ static ar_backlight_in_t backlight_in(ar_screen_t screen, bool usb_power) {
     return in;
 }
 
-static void test_backlight_on_usb_power(void) {
-    // 插着 USB 主机,默认 30 分钟熄屏:亮屏事件后 5 分钟内用设定亮度,之后降到低亮度,满 30 分钟熄屏
+static void test_backlight_on_power(void) {
+    // 接着电源(USB 主机或充电器),默认 30 分钟熄屏:亮屏事件后 5 分钟内用设定亮度,之后降到低亮度,满 30 分钟熄屏
     const uint32_t off = ar_usb_off_ms(AR_USB_OFF_DEFAULT);
     assert(off == 1800000u);
     ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, true);
@@ -271,7 +271,7 @@ static void test_unplug_keeps_screen_on(void) {
     ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, true);
     in.ms_since_wake = 60000;
     assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
-    in.on_usb_power = false;
+    in.on_power = false;
     assert(ar_model_backlight_percent(&in) == 0);
 
     ar_power_t p;
@@ -284,13 +284,217 @@ static void test_unplug_keeps_screen_on(void) {
     assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
     assert(!ar_power_update(&p, false, true));
 
-    // 屏幕已熄灭时拔线(或 Mac 睡眠导致 USB 主机离线)不点亮
+    // 屏幕已熄灭时断电不点亮
     ar_power_init(&p);
     ar_power_update(&p, true, false);
     assert(!ar_power_update(&p, false, false));
-    // 插上 USB 不在这里点亮:连上电脑另有亮屏事件
+    // 接上电源一律点亮:熄屏、手动熄屏时都算亮屏事件(手动熄屏由调用方的 wake() 解除)
+    assert(ar_power_update(&p, true, false));
+    assert(!ar_power_update(&p, true, false));   // 一直接着不重复点亮
+    ar_power_update(&p, false, true);
+    assert(ar_power_update(&p, true, true));
+    // 开机时已接着电源:开机本身算亮屏事件,这里只记基准
+    ar_power_init(&p);
     assert(!ar_power_update(&p, true, false));
-    assert(!ar_power_update(&p, true, true));
+}
+
+// ---- 外部供电推断(ar_extpower_*)----
+// 数据取自 2026-11-10 真机采集(电量 97%,每 500 ms 一点):插上 +75..+94 mV,
+// 充满停充 -42..-49 mV,停充后拔掉 -16..-20 mV,其余时间相邻点相差不超过 3 mV。
+
+#define SOC 97
+
+// 依次送入一段电压,每点按 AR_LOAD_STEADY、USB 主机离线处理;返回最后一点之后是否接着电源
+static bool feed(ar_extpower_t *p, const int *mv, size_t n) {
+    bool on = false;
+    for (size_t i = 0; i < n; i++) on = ar_extpower_update(p, mv[i], SOC, false, AR_LOAD_STEADY);
+    return on;
+}
+
+// 送入一段电压,返回第几点(从 0 起)时判定结果第一次变为 want;一直没变返回 -1
+static int feed_until(ar_extpower_t *p, const int *mv, size_t n, bool want) {
+    for (size_t i = 0; i < n; i++) {
+        if (ar_extpower_update(p, mv[i], SOC, false, AR_LOAD_STEADY) == want) return (int)i;
+    }
+    return -1;
+}
+
+#define LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+static void test_extpower_measured_charger(void) {
+    // 电池供电 → 插充电器 → 充满停充 → 停充后拔掉。跳变前后是真机原始数据;停充后的回落段
+    // 把真机约 90 秒、20 mV 的回落压缩成 23 点,比实际更陡
+    static const int battery[] = {4111, 4111, 4111, 4111, 4112, 4112, 4111, 4111, 4111, 4111, 4112, 4111, 4111, 4111};
+    static const int plug[] = {4205, 4203, 4205, 4206, 4207, 4208, 4210, 4212, 4213, 4215, 4215, 4216, 4215, 4215};
+    static const int term[] = {4167, 4166, 4165, 4165, 4164, 4163, 4162, 4160, 4158, 4157, 4155, 4153, 4152, 4150,
+                               4149, 4148, 4148, 4147, 4147, 4147, 4148, 4147, 4148};
+    static const int unplug[] = {4132, 4131, 4130, 4129, 4129, 4128, 4127, 4126, 4126, 4125};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    assert(!feed(&p, battery, LEN(battery)));
+    // 跳变连续两点成立才算,第二点(1 秒内)判定接上
+    assert(feed_until(&p, plug, LEN(plug), true) == 1);
+    assert(feed(&p, plug + 2, LEN(plug) - 2));
+    // 恒压段停充:降幅 48 mV,仍接着电源
+    assert(feed_until(&p, term, LEN(term), false) == -1);
+    // 停充后拔掉:降幅 16 mV,第二点判定断开
+    assert(feed_until(&p, unplug, LEN(unplug), false) == 1);
+    assert(!feed(&p, unplug + 2, LEN(unplug) - 2));
+}
+
+static void test_extpower_measured_second_round(void) {
+    // 第二轮:停充降幅 42 mV、停充后拔掉降幅 17 mV,同样判对(回落段同样压缩过)
+    static const int battery[] = {4114, 4113, 4113, 4114, 4115, 4115, 4113, 4113, 4114, 4113, 4113, 4113, 4113, 4113};
+    static const int plug[] = {4208, 4210, 4211, 4211, 4211, 4212, 4214, 4215, 4216, 4214, 4214, 4214, 4215, 4215};
+    static const int term[] = {4173, 4172, 4172, 4171, 4171, 4170, 4168, 4166, 4165, 4164, 4163, 4162, 4162, 4161,
+                               4160, 4161, 4160, 4160, 4161, 4160, 4160, 4161};
+    static const int unplug[] = {4144, 4143, 4143, 4143, 4142, 4142, 4143, 4142};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    assert(!feed(&p, battery, LEN(battery)));
+    assert(feed_until(&p, plug, LEN(plug), true) == 1);
+    assert(feed(&p, plug + 2, LEN(plug) - 2));
+    assert(feed_until(&p, term, LEN(term), false) == -1);
+    assert(feed_until(&p, unplug, LEN(unplug), false) == 1);
+}
+
+static void test_extpower_noise_and_dips_on_battery(void) {
+    // 电池供电时的噪声与负载下陷不能判成接上:相邻点 ±3 mV,单点下陷 10 mV,
+    // 持续 3 秒(6 点)的下陷 15 mV 后回升。回升只是回到原电平,不是跳变;下陷期间若把基准换成
+    // 下陷电平,回升就会被误判成插上
+    static const int trace[] = {4120, 4121, 4119, 4122, 4120, 4118, 4121, 4120, 4110, 4120, 4121, 4119,
+                                4105, 4105, 4106, 4105, 4104, 4105, 4120, 4121, 4120, 4122, 4120, 4119,
+                                4121, 4120, 4120};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    assert(feed_until(&p, trace, LEN(trace), true) == -1);
+}
+
+static void test_extpower_unplug_while_charging(void) {
+    // 恒流段(电压低于恒压段)拔掉:任何达到 AR_PWR_STEP_MV 的降幅都是断开
+    static const int battery[] = {3800, 3800, 3801, 3800, 3799, 3800, 3800, 3800};
+    static const int charging[] = {3900, 3901, 3902, 3902, 3903, 3904, 3904, 3905};
+    static const int unplug[] = {3810, 3809, 3809, 3808};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    assert(feed(&p, charging, LEN(charging)));
+    assert(feed_until(&p, unplug, LEN(unplug), false) == 1);
+
+    // 恒压段拔掉:降幅达到 AR_PWR_TERM_MAX_MV,不是停充,判断开
+    static const int cv[] = {4215, 4215, 4216, 4215, 4215, 4215, 4216, 4215};
+    const int drop = 4215 - AR_PWR_TERM_MAX_MV;
+    const int cv_unplug[] = {drop, drop, drop - 1, drop - 1};
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    assert(feed(&p, cv, LEN(cv)));
+    assert(feed_until(&p, cv_unplug, LEN(cv_unplug), false) == 1);
+    // 降幅差 1 mV 不到上限:按停充处理,仍接着电源
+    const int cv_term[] = {drop + 1, drop + 1, drop, drop};
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, cv, LEN(cv));
+    assert(feed_until(&p, cv_term, LEN(cv_term), false) == -1);
+}
+
+static void test_extpower_step_threshold(void) {
+    // 跳变门限:差 1 mV 不算,刚好 AR_PWR_STEP_MV 算(电池充满、充电器不再充电时,
+    // 插上只剩负载转到充电器带来的上跳,实测停充后拔掉的降幅 16..20 mV)
+    static const int base[] = {4150, 4150, 4150, 4150, 4150, 4150, 4150, 4150};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, base, LEN(base));
+    const int small[] = {4150 + AR_PWR_STEP_MV - 1, 4150 + AR_PWR_STEP_MV - 1, 4150 + AR_PWR_STEP_MV - 1};
+    assert(feed_until(&p, small, LEN(small), true) == -1);
+    ar_extpower_init(&p);
+    feed(&p, base, LEN(base));
+    const int enough[] = {4150 + AR_PWR_STEP_MV, 4150 + AR_PWR_STEP_MV};
+    assert(feed_until(&p, enough, LEN(enough), true) == 1);
+    // 只有一点跳上去又回落:是毛刺,不算
+    ar_extpower_init(&p);
+    feed(&p, base, LEN(base));
+    const int spike[] = {4200, 4150, 4150, 4150};
+    assert(feed_until(&p, spike, LEN(spike), true) == -1);
+}
+
+static void test_extpower_usb_host(void) {
+    // USB 主机在线时一定接着电源;离线但电压没有降(Mac 睡眠、USB 挂起)仍接着电源
+    static const int idle[] = {4141, 4141, 4140, 4141, 4141, 4140, 4140, 4141, 4140, 4140};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    for (size_t i = 0; i < LEN(idle); i++) assert(ar_extpower_update(&p, idle[i], SOC, true, AR_LOAD_STEADY));
+    assert(feed_until(&p, idle, LEN(idle), false) == -1);
+    // 真机:停充状态下从电脑拔掉,降 18..20 mV,第二点判定断开
+    static const int unplug[] = {4123, 4121, 4121, 4122, 4121, 4121};
+    assert(feed_until(&p, unplug, LEN(unplug), false) == 1);
+    // USB 主机在线期间的降幅不算断开
+    ar_extpower_init(&p);
+    for (size_t i = 0; i < LEN(idle); i++) ar_extpower_update(&p, idle[i], SOC, true, AR_LOAD_STEADY);
+    for (size_t i = 0; i < LEN(unplug); i++) assert(ar_extpower_update(&p, unplug[i], SOC, true, AR_LOAD_STEADY));
+    // 读不到电压时只看 USB 主机
+    ar_extpower_init(&p);
+    assert(!ar_extpower_update(&p, -1, -1, false, AR_LOAD_STEADY));
+    assert(ar_extpower_update(&p, -1, -1, true, AR_LOAD_STEADY));
+}
+
+static void test_extpower_cv_level(void) {
+    // 开机时已在恒压充电(没有插上的跳变):电压连续两点达到 AR_PWR_CV_MV 即判定接着电源。
+    // 电池单独供电时实测不超过 4150 mV
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    assert(!ar_extpower_update(&p, AR_PWR_CV_MV, SOC, false, AR_LOAD_STEADY));
+    assert(ar_extpower_update(&p, AR_PWR_CV_MV + 2, SOC, false, AR_LOAD_STEADY));
+    ar_extpower_init(&p);
+    static const int below[] = {AR_PWR_CV_MV - 1, AR_PWR_CV_MV - 1, AR_PWR_CV_MV - 1};
+    assert(feed_until(&p, below, LEN(below), true) == -1);
+}
+
+static void test_extpower_own_load_changes(void) {
+    // 设备自己改背光会让电压跳一下:从设定亮度调回低亮度,电池上的电压回升约 14 mV(估算)。
+    // 调用方传 AR_LOAD_CHANGED 时以新电平为基准,不判成接上
+    static const int base[] = {4120, 4120, 4121, 4120, 4120, 4120, 4121, 4120};
+    static const int after[] = {4134, 4134, 4135, 4134, 4134, 4135, 4134, 4134};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, base, LEN(base));
+    ar_extpower_update(&p, after[0], SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, after[1], SOC, false, AR_LOAD_CHANGED);
+    assert(feed_until(&p, after + 2, LEN(after) - 2, true) == -1);
+    // 不标负载变化时同样的回升会判成接上(说明上面靠的是基准重置)
+    ar_extpower_init(&p);
+    feed(&p, base, LEN(base));
+    assert(feed_until(&p, after, LEN(after), true) == 1);
+
+    // 提示音期间的点(AR_LOAD_TRANSIENT)不计入:响铃时的大幅下陷不会判成断开
+    static const int cv[] = {4215, 4215, 4216, 4215, 4215, 4215, 4216, 4215};
+    ar_extpower_init(&p);
+    feed(&p, cv, LEN(cv));
+    assert(ar_extpower_update(&p, 4100, SOC, false, AR_LOAD_TRANSIENT));
+    assert(ar_extpower_update(&p, 4100, SOC, false, AR_LOAD_TRANSIENT));
+    assert(feed_until(&p, cv, LEN(cv), false) == -1);
+}
+
+static void test_extpower_soc_fallback(void) {
+    // 兜底:判定接着电源、USB 主机离线,电量却比接上后的最高值低了 AR_PWR_SOC_FALL,
+    // 说明其实在耗电池(拔线没识别出来),改判断开
+    static const int battery[] = {4111, 4111, 4111, 4111, 4112, 4112, 4111, 4111};
+    static const int plug[] = {4205, 4203, 4205, 4206};
+    static const int term[] = {4167, 4166, 4165, 4165, 4164, 4163, 4162, 4160};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, plug, LEN(plug));
+    feed(&p, term, LEN(term));
+    assert(ar_extpower_update(&p, 4160, SOC - AR_PWR_SOC_FALL + 1, false, AR_LOAD_STEADY));
+    assert(!ar_extpower_update(&p, 4160, SOC - AR_PWR_SOC_FALL, false, AR_LOAD_STEADY));
+    // 读不到电量时不触发兜底;USB 主机在线时不触发兜底
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, plug, LEN(plug));
+    assert(ar_extpower_update(&p, 4206, -1, false, AR_LOAD_STEADY));
+    ar_extpower_init(&p);
+    ar_extpower_update(&p, 4141, SOC, true, AR_LOAD_STEADY);
+    assert(ar_extpower_update(&p, 4141, SOC - 5, true, AR_LOAD_STEADY));
 }
 
 static void test_any_key_wakes_dark_screen(void) {
@@ -420,7 +624,7 @@ static void test_volume(void) {
 // 深睡判定的默认输入:电池供电、电量计正常、不在配对确认,未连接与无按键都刚好满时限
 static ar_sleep_in_t sleep_in(void) {
     ar_sleep_in_t in = {
-        .on_usb_power = false,
+        .on_power = false,
         .battery_present = true,
         .confirming = false,
         .ms_disconnected = AR_DEEP_SLEEP_AFTER_MS,
@@ -455,7 +659,7 @@ static void test_deep_sleep_after_long_disconnect_on_battery(void) {
 // 熄屏关机判定的默认输入:电池供电、在线、刚按过键,只有熄屏时长满 1 小时
 static ar_sleep_in_t dark_in(void) {
     ar_sleep_in_t in = {
-        .on_usb_power = false,
+        .on_power = false,
         .battery_present = true,
         .confirming = false,
         .ms_disconnected = 0,
@@ -478,7 +682,7 @@ static void test_power_off_after_dark_hour_on_battery(void) {
 
     // 插着 USB 主机、读不到电量计、等待配对确认时都不关机
     in = dark_in();
-    in.on_usb_power = true;
+    in.on_power = true;
     assert(!ar_model_should_deep_sleep(&in));
     in = dark_in();
     in.battery_present = false;
@@ -491,7 +695,7 @@ static void test_power_off_after_dark_hour_on_battery(void) {
 static void test_no_deep_sleep_when_powered_or_pairing(void) {
     // 接着 USB 主机时不睡
     ar_sleep_in_t in = sleep_in();
-    in.on_usb_power = true;
+    in.on_power = true;
     assert(!ar_model_should_deep_sleep(&in));
     // 电量计读不到(可能没装电池)时不睡,避免 Mac 睡眠期间只靠 USB 供电的设备睡下去
     in = sleep_in();
@@ -762,10 +966,19 @@ int main(void) {
     test_brightness();
     test_menu_navigation();
     test_menu_timeouts();
-    test_backlight_on_usb_power();
+    test_backlight_on_power();
     test_backlight_on_battery();
     test_backlight_off_when_disconnected();
     test_unplug_keeps_screen_on();
+    test_extpower_measured_charger();
+    test_extpower_measured_second_round();
+    test_extpower_noise_and_dips_on_battery();
+    test_extpower_unplug_while_charging();
+    test_extpower_step_threshold();
+    test_extpower_usb_host();
+    test_extpower_cv_level();
+    test_extpower_own_load_changes();
+    test_extpower_soc_fallback();
     test_any_key_wakes_dark_screen();
     test_notice_events();
     test_chime_rules();
