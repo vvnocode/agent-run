@@ -497,6 +497,87 @@ static void test_extpower_soc_fallback(void) {
     assert(ar_extpower_update(&p, 4141, SOC - 5, true, AR_LOAD_STEADY));
 }
 
+static void test_extpower_plug_step_reported(void) {
+    // 插上的跳变本身要报出来(plugged),调用方据此亮屏。只看判定从电池变成接着电源不够:
+    // 漏判过一次拔掉,判定就一直是接着电源,再插上判定不变,屏幕不会亮
+    static const int battery[] = {4111, 4111, 4111, 4111, 4112, 4112, 4111, 4111};
+    static const int plug[] = {4205, 4203, 4205, 4206, 4207, 4208};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    assert(!p.plugged);
+    // 正常插上:判定接上的那一点报一次,之后不再报
+    ar_extpower_update(&p, plug[0], SOC, false, AR_LOAD_STEADY);
+    assert(!p.plugged);
+    assert(ar_extpower_update(&p, plug[1], SOC, false, AR_LOAD_STEADY));
+    assert(p.plugged);
+    for (size_t i = 2; i < LEN(plug); i++) {
+        ar_extpower_update(&p, plug[i], SOC, false, AR_LOAD_STEADY);
+        assert(!p.plugged);
+    }
+
+    // 拔掉的跳变落在背光变化的两点里(调用方传 AR_LOAD_CHANGED),被当成负载变化吃掉,
+    // 判定仍是接着电源;之后再插上,判定不变,但插上的跳变照样报出来
+    static const int unplugged[] = {4140, 4140, 4141, 4140, 4140, 4140, 4141, 4140};
+    ar_extpower_update(&p, unplugged[0], SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, unplugged[1], SOC, false, AR_LOAD_CHANGED);
+    assert(feed(&p, unplugged + 2, LEN(unplugged) - 2));   // 前提:拔掉被漏判
+    ar_extpower_update(&p, 4206, SOC, false, AR_LOAD_STEADY);
+    assert(!p.plugged);
+    assert(ar_extpower_update(&p, 4207, SOC, false, AR_LOAD_STEADY));
+    assert(p.plugged);
+    ar_extpower_update(&p, 4208, SOC, false, AR_LOAD_STEADY);
+    assert(!p.plugged);   // 同一次跳变只报一次
+
+    // 恒压段末尾拔掉、降幅不到 AR_PWR_TERM_MAX_MV,被当成充满停充:判定同样过时,再插上也要报
+    static const int cv[] = {4215, 4215, 4216, 4215, 4215, 4215, 4216, 4215};
+    const int low = 4215 - AR_PWR_TERM_MAX_MV + 5;
+    const int stale[] = {low, low, low + 1, low, low, low};
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, cv, LEN(cv));
+    assert(feed(&p, stale, LEN(stale)));   // 前提:判成停充,仍是接着电源
+    ar_extpower_update(&p, 4214, SOC, false, AR_LOAD_STEADY);
+    assert(ar_extpower_update(&p, 4215, SOC, false, AR_LOAD_STEADY));
+    assert(p.plugged);
+}
+
+static void test_extpower_step_soon_after_load_change(void) {
+    // 背光变化后基准重新开始。只要攒到 1 点基准就要能判断:锁屏、插上亮屏后 1 秒左右插拔都要认出来。
+    // 要攒满 4 点时,背光变化后 2..3 秒内的插拔会混进基准,之后再也比不出来
+    static const int battery[] = {3800, 3800, 3801, 3800, 3799, 3800, 3800, 3800};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    // 恒流段(电压低于恒压段,没有电压兜底):锁屏后马上插上
+    ar_extpower_update(&p, 3800, SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, 3801, SOC, false, AR_LOAD_CHANGED);
+    static const int plug[] = {3900, 3901, 3902, 3902, 3903, 3904, 3904, 3905};
+    assert(feed_until(&p, plug, LEN(plug), true) == 1);
+    // 插上亮屏(背光变化)后马上拔掉
+    ar_extpower_update(&p, 3906, SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, 3906, SOC, false, AR_LOAD_CHANGED);
+    static const int unplug[] = {3810, 3809, 3809, 3808, 3808, 3808, 3807, 3807};
+    assert(feed_until(&p, unplug, LEN(unplug), false) == 1);
+
+    // 恒压段同样:插上亮屏后马上拔掉,降幅超过停充上限,判断开
+    static const int battery_full[] = {4140, 4140, 4141, 4140, 4139, 4140, 4140, 4140};
+    ar_extpower_init(&p);
+    feed(&p, battery_full, LEN(battery_full));
+    ar_extpower_update(&p, 4205, SOC, false, AR_LOAD_STEADY);
+    assert(ar_extpower_update(&p, 4206, SOC, false, AR_LOAD_STEADY));
+    ar_extpower_update(&p, 4214, SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, 4214, SOC, false, AR_LOAD_CHANGED);
+    static const int cv_unplug[] = {4150, 4149, 4149, 4148, 4148, 4148};
+    assert(feed_until(&p, cv_unplug, LEN(cv_unplug), false) == 1);
+
+    // 基准只有 1 点时,相邻点 ±3 mV 的噪声不能判成插拔
+    static const int noise[] = {4148, 4151, 4145, 4150, 4146, 4149, 4145, 4151, 4147, 4150};
+    ar_extpower_update(&p, 4148, SOC, false, AR_LOAD_CHANGED);
+    ar_extpower_update(&p, 4148, SOC, false, AR_LOAD_CHANGED);
+    assert(feed_until(&p, noise, LEN(noise), true) == -1);
+}
+
 static void test_any_key_wakes_dark_screen(void) {
     ar_keywake_t k;
     ar_keywake_init(&k);
@@ -979,6 +1060,8 @@ int main(void) {
     test_extpower_cv_level();
     test_extpower_own_load_changes();
     test_extpower_soc_fallback();
+    test_extpower_plug_step_reported();
+    test_extpower_step_soon_after_load_change();
     test_any_key_wakes_dark_screen();
     test_notice_events();
     test_chime_rules();

@@ -359,6 +359,7 @@ typedef struct {
     uint8_t n;                    // 有效采样点数
     uint8_t state;                // ar_pwr_state_t
     int8_t peak_soc;              // 判定接着电源以来的最高电量,-1 表示还没有读数
+    bool plugged;                 // 本次采样认出了插上的跳变,调用方据此亮屏
 } ar_extpower_t;
 
 void ar_extpower_init(ar_extpower_t *p);
@@ -366,13 +367,16 @@ void ar_extpower_init(ar_extpower_t *p);
 // 每 AR_PWR_SAMPLE_MS 调用一次,返回是否接着外部电源。mv、soc 为电量计读数,读失败传负数;
 // usb_host 为 USB 主机在线。规则(最近两点都要满足,避免单点毛刺):
 // - USB 主机在线:一定接着电源;离线时不改判定,电压没有降(Mac 睡眠、USB 挂起)就仍算接着电源;
-// - 两点都比之前 6 秒的最高值高出 AR_PWR_STEP_MV:插上,进入充电;
-// - 两点都达到 AR_PWR_CV_MV:电池单独供电达不到这个电压,进入充电(开机时已在恒压充电);
+// - 两点都比之前 6 秒的最高值高出 AR_PWR_STEP_MV:插上,进入充电,并置 plugged。已判定接着电源时
+//   也这样处理:判定可能因漏判拔掉而过时,调用方要按 plugged 亮屏,不能只看返回值的变化;
+// - 电池供电时两点都达到 AR_PWR_CV_MV:电池单独供电达不到这个电压,进入充电并置 plugged
+//   (开机时已在恒压充电,或插上的跳变被负载变化盖过);
 // - 接着电源时,两点都比之前 2 秒的中位数低 AR_PWR_STEP_MV:从恒压段降、且降幅小于
 //   AR_PWR_TERM_MAX_MV 是充满停充,仍接着电源;否则是拔掉(USB 主机在线时除外)。电池供电时的
 //   下陷是负载引起的,不改判定、不重置基准,回升时才不会被当成插上;
 // - 兜底:判定接着电源、USB 主机离线,电量比判定以来的最高值低 AR_PWR_SOC_FALL,改判电池供电。
-// 判定改变后只留最近两点作新基准,同一次跳变不会重复触发
+// 判定改变或认出插上后只留最近两点作新基准,同一次跳变不会重复触发;基准有 1 点就开始判断,
+// 背光变化、判定改变后不久的插拔不会混进基准
 bool ar_extpower_update(ar_extpower_t *p, int mv, int soc, bool usb_host, ar_load_t load);
 
 // 供电方式跟踪,用来在插拔时补记亮屏事件
@@ -384,7 +388,8 @@ typedef struct {
 void ar_power_init(ar_power_t *p);
 
 // 每个周期调用一次。返回 true 表示调用方应记一次亮屏事件:
-// - 接上电源(USB 主机或充电器):不论屏幕亮灭、是否手动熄屏、是否勿扰都点亮,插电是用户自己的操作;
+// - 接上电源(USB 主机或充电器):不论屏幕亮灭、是否手动熄屏、是否勿扰都点亮,插电是用户自己的操作。
+//   这里只看判定的变化;判定已是接着电源时的插上由 ar_extpower_t.plugged 报告,调用方同样亮屏;
 // - 断开电源且此刻屏幕亮着:电池熄屏时限短得多(默认 30 秒),按最近一次亮屏事件计时会让屏幕立刻熄灭。
 // 第一次调用只记录基准:开机本身就算亮屏事件
 bool ar_power_update(ar_power_t *p, bool on_power, bool screen_on);
