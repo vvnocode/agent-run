@@ -11,6 +11,10 @@ static const uint8_t BRIGHTNESS_PERCENT[AR_BRIGHTNESS_LEVELS] = { 20, 40, 60, 80
 // 音量档位对应的播放音量百分比(ES8311 输出音量,0 为静音)
 static const uint8_t VOLUME_PERCENT[AR_VOLUME_LEVELS] = { 0, 40, 60, 80 };
 
+// 熄屏时间选项对应的毫秒数
+static const uint32_t BATTERY_OFF_MS[AR_BATTERY_OFF_OPTIONS] = { 10000u, 30000u, 60000u, 180000u };
+static const uint32_t USB_OFF_MS[AR_USB_OFF_OPTIONS] = { 300000u, 600000u, 1800000u, 3600000u, AR_OFF_NEVER };
+
 unsigned ar_model_working_total(const ar_state_t *s) {
     return (unsigned)s->cc + (unsigned)s->cx + (unsigned)s->ds;
 }
@@ -144,6 +148,30 @@ ar_chime_kind_t ar_chime_pick(ar_chime_t *c, ar_notice_ev_t ev, uint32_t now_ms,
     return AR_CHIME_NONE;
 }
 
+void ar_remind_init(ar_remind_t *r) {
+    r->active = false;
+    r->count = 0;
+    r->since_ms = 0;
+}
+
+bool ar_remind_update(ar_remind_t *r, uint8_t wn, bool fresh, uint32_t now_ms) {
+    if (wn == 0) {
+        ar_remind_init(r);
+        return false;
+    }
+    // 新增等你处理,或第一次发现已在等待(开机、掉线恢复):从此刻起重新计时、重新计次
+    if (fresh || !r->active) {
+        r->active = true;
+        r->count = 0;
+        r->since_ms = now_ms;
+        return false;
+    }
+    if (r->count >= AR_REMIND_MAX || !interval_passed(true, r->since_ms, now_ms, AR_REMIND_AFTER_MS)) return false;
+    r->count++;
+    r->since_ms = now_ms;
+    return true;
+}
+
 uint8_t ar_volume_percent(uint8_t level) {
     if (level >= AR_VOLUME_LEVELS) level = AR_VOLUME_LEVELS - 1;
     return VOLUME_PERCENT[level];
@@ -168,6 +196,67 @@ uint8_t ar_brightness_step(uint8_t level, int delta) {
     if (next < 0) next = 0;
     if (next >= AR_BRIGHTNESS_LEVELS) next = AR_BRIGHTNESS_LEVELS - 1;
     return (uint8_t)next;
+}
+
+uint32_t ar_battery_off_ms(uint8_t option) {
+    if (option >= AR_BATTERY_OFF_OPTIONS) option = AR_BATTERY_OFF_OPTIONS - 1;
+    return BATTERY_OFF_MS[option];
+}
+
+uint32_t ar_usb_off_ms(uint8_t option) {
+    if (option >= AR_USB_OFF_OPTIONS) option = AR_USB_OFF_OPTIONS - 1;
+    return USB_OFF_MS[option];
+}
+
+uint8_t ar_option_step(uint8_t option, uint8_t count, int delta) {
+    if (count == 0) return 0;
+    if (option >= count) option = (uint8_t)(count - 1);
+    int next = (int)option + delta;
+    if (next < 0) next = 0;
+    if (next >= count) next = count - 1;
+    return (uint8_t)next;
+}
+
+bool ar_toggle_step(bool on, int delta) {
+    if (delta > 0) return true;
+    if (delta < 0) return false;
+    return on;
+}
+
+void ar_clock_init(ar_clock_t *c) {
+    c->known = false;
+    c->minute = 0;
+    c->at_ms = 0;
+}
+
+void ar_clock_sync(ar_clock_t *c, uint16_t minute, uint32_t at_ms) {
+    if (minute > AR_TIME_MAX_MIN) return;   // 含 AR_TIME_UNKNOWN
+    c->known = true;
+    c->minute = minute;
+    c->at_ms = at_ms;
+}
+
+bool ar_clock_minute(const ar_clock_t *c, uint32_t now_ms, uint16_t *minute) {
+    if (!c->known) return false;
+    // 无符号差值在毫秒计数回绕时仍然正确;每次收到状态帧都会重新对时,不会累计到回绕一圈
+    const uint32_t elapsed_min = (uint32_t)(now_ms - c->at_ms) / 60000u;
+    *minute = (uint16_t)((c->minute + elapsed_min % 1440u) % 1440u);
+    return true;
+}
+
+bool ar_is_night(uint16_t minute) {
+    return minute >= AR_NIGHT_START_MIN || minute < AR_NIGHT_END_MIN;
+}
+
+ar_night_t ar_night_state(const ar_clock_t *c, uint32_t now_ms) {
+    uint16_t minute;
+    if (!ar_clock_minute(c, now_ms, &minute)) return AR_NIGHT_NO_TIME;
+    return ar_is_night(minute) ? AR_NIGHT_ON : AR_NIGHT_OFF;
+}
+
+bool ar_dnd_active(bool manual, bool night_enabled, const ar_clock_t *c, uint32_t now_ms) {
+    if (manual) return true;
+    return night_enabled && ar_night_state(c, now_ms) == AR_NIGHT_ON;
 }
 
 void ar_menu_init(ar_menu_t *m) {
@@ -254,16 +343,24 @@ bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on) {
     return unplugged && screen_on;
 }
 
+bool ar_lock_allowed(bool menu_open, bool pairing) {
+    return !menu_open && !pairing;
+}
+
 uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in) {
+    if (in->locked) return 0;
     const uint8_t normal = ar_brightness_percent(in->level);
     const uint8_t dim = normal < AR_DIM_PERCENT ? normal : AR_DIM_PERCENT;   // 只降不升
-    if (!in->on_usb_power) return in->ms_since_wake < AR_BATTERY_OFF_AFTER_MS ? dim : 0;
+    if (!in->on_usb_power) return in->ms_since_wake < ar_battery_off_ms(in->battery_off) ? dim : 0;
     if (in->screen == AR_SCREEN_DISCONNECTED && in->ms_disconnected >= AR_BACKLIGHT_IDLE_MS &&
         in->ms_since_wake >= AR_BACKLIGHT_IDLE_MS) {
         return 0;
     }
-    if (in->ms_since_wake < AR_USB_DIM_AFTER_MS) return normal;
-    if (in->ms_since_wake < AR_USB_OFF_AFTER_MS) return dim;
+    // 熄屏时间较短时在它的一半调暗,保证熄屏前有一段低亮度提示;“不熄屏”只调暗
+    const uint32_t off = ar_usb_off_ms(in->usb_off);
+    const uint32_t dim_after = off != AR_OFF_NEVER && off / 2u < AR_USB_DIM_AFTER_MS ? off / 2u : AR_USB_DIM_AFTER_MS;
+    if (in->ms_since_wake < dim_after) return normal;
+    if (off == AR_OFF_NEVER || in->ms_since_wake < off) return dim;
     return 0;
 }
 

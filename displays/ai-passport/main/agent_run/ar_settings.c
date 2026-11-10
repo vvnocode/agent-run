@@ -50,3 +50,43 @@ void ar_settings_save_brightness(uint8_t level) {
 void ar_settings_save_volume(uint8_t level) {
     save_u8("vol", level);
 }
+
+void ar_settings_load_screen_off(uint8_t *battery_option, uint8_t *usb_option) {
+    *battery_option = AR_BATTERY_OFF_DEFAULT;
+    *usb_option = AR_USB_OFF_DEFAULT;
+    if (!s_nvs_ok) return;
+    nvs_handle_t h;
+    if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t v;
+    if (nvs_get_u8(h, "bat_off", &v) == ESP_OK && v < AR_BATTERY_OFF_OPTIONS) *battery_option = v;
+    if (nvs_get_u8(h, "usb_off", &v) == ESP_OK && v < AR_USB_OFF_OPTIONS) *usb_option = v;
+    nvs_close(h);
+}
+
+void ar_settings_save_battery_off(uint8_t option) {
+    save_u8("bat_off", option);
+}
+
+void ar_settings_save_usb_off(uint8_t option) {
+    save_u8("usb_off", option);
+}
+
+void ar_settings_load_dnd(bool *manual, bool *night) {
+    *manual = false;
+    *night = false;
+    if (!s_nvs_ok) return;
+    nvs_handle_t h;
+    if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t v;
+    if (nvs_get_u8(h, "dnd", &v) == ESP_OK) *manual = v != 0;
+    if (nvs_get_u8(h, "night", &v) == ESP_OK) *night = v != 0;
+    nvs_close(h);
+}
+
+void ar_settings_save_dnd(bool manual) {
+    save_u8("dnd", manual ? 1 : 0);
+}
+
+void ar_settings_save_night(bool night) {
+    save_u8("night", night ? 1 : 0);
+}

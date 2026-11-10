@@ -48,6 +48,25 @@
 #define AR_TXT_VOLUME_MID "中"
 #define AR_TXT_VOLUME_HIGH "高"
 
+// 设置菜单:熄屏时间与勿扰(屏幕方案 §4、§6、§7)
+#define AR_TXT_MENU_BATTERY_OFF "电池熄屏"
+#define AR_TXT_MENU_USB_OFF "接电脑熄屏"
+#define AR_TXT_MENU_DND "勿扰"
+#define AR_TXT_MENU_NIGHT "夜间勿扰"
+#define AR_TXT_MENU_TOGGLE_HINT "上下切换 · 双击返回"
+// 熄屏时间各选项的显示文字,顺序与 ar_battery_off_ms()、ar_usb_off_ms() 的选项一致
+#define AR_TXT_BATTERY_OFF_NAMES { "10 秒", "30 秒", "1 分", "3 分" }
+#define AR_TXT_USB_OFF_NAMES { "5 分", "10 分", "30 分", "1 小时", "不熄屏" }
+#define AR_TXT_BATTERY_OFF_RANGE "10 秒 – 3 分"
+#define AR_TXT_USB_OFF_RANGE "5 分 – 不熄屏"
+#define AR_TXT_ON "开启"
+#define AR_TXT_OFF "关闭"
+#define AR_TXT_DND_DESC "不响铃，通知不点亮屏幕"
+#define AR_TXT_NIGHT_DESC "每天 22:00 – 08:00"
+#define AR_TXT_NIGHT_ACTIVE "现在生效中"
+#define AR_TXT_NIGHT_INACTIVE "现在未生效"
+#define AR_TXT_NIGHT_NO_TIME "连上电脑同步时间后生效"
+
 // 工具专用页面(专用页面方案 §4.2)
 #define AR_TXT_USAGE_FIVE_HOUR "5 小时用量"
 #define AR_TXT_USAGE_WEEK "每周用量"

@@ -91,6 +91,10 @@ static bool parse_field(const char *start, const char *end, ar_state_t *st, uint
     } else if (KEY_IS("w")) {
         if (!parse_wait_list(v, end, st)) return false;
         *seen |= F_W;
+    } else if (KEY_IS("tm")) {
+        // 可选字段,不计入必填掩码;出现时必须合法
+        if (!parse_uint(v, end, AR_TIME_MAX_MIN, &n)) return false;
+        st->tm = (uint16_t)n;
     }
 #undef KEY_IS
     return true;
@@ -110,6 +114,7 @@ ar_line_kind_t ar_proto_parse_line(const char *line, ar_state_t *out) {
     // 先解析到临时结构,全部合法后再写回调用方,避免半帧污染当前状态
     ar_state_t st;
     memset(&st, 0, sizeof(st));
+    st.tm = AR_TIME_UNKNOWN;
     uint32_t seen = 0;
     while (p < end) {
         const char *tok_end = memchr(p, ' ', (size_t)(end - p));

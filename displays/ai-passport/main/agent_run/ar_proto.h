@@ -1,7 +1,7 @@
 // main/agent_run/ar_proto.h —— Agent Run! 串口协议解析(纯 C,可宿主测试)。
 //
 // 协议见 docs/specs/2026-11-08-agent-run-design.md §6(外层仓库)。主机每行发送:
-//   AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q
+//   AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q tm=1342   tm 可选,见 -screen-dnd-design.md §8
 //   AR1 A t=CX wn=0 bg=0 done=3 h=x hr=- w=5 wr=6110      工具专用页面,见 -agent-pages-design.md §5.2
 //   AR1 PING
 // 本模块只做“字节 → 行 → 结构体”,不依赖 ESP-IDF / LVGL。
@@ -49,6 +49,10 @@ typedef struct {
 // A 帧里套餐名(p 字段)的最大字符数,与主机端 protocol.MAX_PLAN_CHARS 一致
 #define AR_PLAN_MAX 10
 
+// 状态帧没有 tm 字段时的本地时间;tm 的取值为当日分钟数 0–1439
+#define AR_TIME_UNKNOWN 0xFFFFu
+#define AR_TIME_MAX_MIN 1439u
+
 // 一个工具专用页面的数据(A 帧)
 typedef struct {
     uint8_t tool;     // AR_TOOL_CC 或 AR_TOOL_CX
@@ -72,6 +76,7 @@ typedef struct {
     uint8_t wn;        // 等你处理总数
     uint8_t w_count;   // w[] 中有效项数,<= AR_PROTO_MAX_WAIT 且 <= wn
     ar_wait_item_t w[AR_PROTO_MAX_WAIT];
+    uint16_t tm;       // 主机本地时间的当日分钟数 0–1439;帧里没有 tm 字段时为 AR_TIME_UNKNOWN
 } ar_state_t;
 
 // 一行的解析结果

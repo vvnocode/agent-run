@@ -17,6 +17,12 @@ typedef struct {
     uint8_t link_source;   // 标题栏链路图标:ar_source_t(无、USB、蓝牙)
     uint8_t volume;        // 音量档位(0 为静音),标题栏喇叭图标与设置菜单
     uint8_t brightness;    // 亮度档位,设置菜单
+    uint8_t battery_off;   // 电池熄屏时间选项,设置菜单
+    uint8_t usb_off;       // 接电脑熄屏时间选项,设置菜单
+    bool dnd;              // 勿扰(手动)开关,设置菜单
+    bool night;            // 夜间勿扰开关,设置菜单
+    uint8_t night_state;   // ar_night_t:夜间勿扰此刻的状态,夜间勿扰二级页面的说明
+    bool dnd_active;       // 勿扰此刻生效,标题栏显示月牙
     uint8_t menu_level;    // ar_menu_level_t:设置菜单的层级,AR_MENU_CLOSED 表示不显示
     uint8_t menu_item;     // ar_menu_item_t:一级的选中项,二级时为正在调节的项
     uint16_t done_flash;   // 刚完成的轮数,大于 0 时普通画面显示“完成 +N”
