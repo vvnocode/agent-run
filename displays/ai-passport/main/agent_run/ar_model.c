@@ -415,7 +415,9 @@ static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
 bool ar_extpower_update(ar_extpower_t *p, int mv, int soc, bool usb_host, ar_load_t load) {
     p->plugged = false;   // 只报本次采样认出的跳变
     if (mv > 0 && load != AR_LOAD_TRANSIENT) {
-        if (load == AR_LOAD_CHANGED) p->n = 0;   // 自身负载变了:旧基准不可比
+        // 自身负载变了:电池供电时旧基准不可比,重新开始。接着电源时负载由充电器带,电池电压不受影响
+        // (实测停充后背光 0 ↔ 100% 电压不变),保留基准,插上亮屏后马上拔掉也认得出
+        if (load == AR_LOAD_CHANGED && p->state == AR_PWR_BATTERY) p->n = 0;
         if (p->n == AR_PWR_HISTORY) {
             memmove(p->mv, p->mv + 1, sizeof(p->mv[0]) * (AR_PWR_HISTORY - 1));
             p->n--;

@@ -516,17 +516,20 @@ static void test_extpower_plug_step_reported(void) {
         assert(!p.plugged);
     }
 
-    // 拔掉的跳变落在背光变化的两点里(调用方传 AR_LOAD_CHANGED),被当成负载变化吃掉,
-    // 判定仍是接着电源;之后再插上,判定不变,但插上的跳变照样报出来
-    static const int unplugged[] = {4140, 4140, 4141, 4140, 4140, 4140, 4141, 4140};
-    ar_extpower_update(&p, unplugged[0], SOC, false, AR_LOAD_CHANGED);
-    ar_extpower_update(&p, unplugged[1], SOC, false, AR_LOAD_CHANGED);
-    assert(feed(&p, unplugged + 2, LEN(unplugged) - 2));   // 前提:拔掉被漏判
-    ar_extpower_update(&p, 4206, SOC, false, AR_LOAD_STEADY);
+    // 充电中漏判了拔掉(这里用降幅不到 AR_PWR_STEP_MV 代表任何没认出来的拔掉),判定一直是
+    // 接着电源;之后再插上,判定不变,但插上的跳变照样报出来,且只报一次
+    static const int cc_battery[] = {3800, 3800, 3801, 3800, 3799, 3800, 3800, 3800};
+    static const int cc[] = {3900, 3901, 3902, 3902, 3903, 3904};
+    static const int unplugged[] = {3895, 3894, 3895, 3894, 3894, 3895};
+    ar_extpower_init(&p);
+    feed(&p, cc_battery, LEN(cc_battery));
+    assert(feed(&p, cc, LEN(cc)));
+    assert(feed(&p, unplugged, LEN(unplugged)));   // 前提:拔掉被漏判
+    ar_extpower_update(&p, 3990, SOC, false, AR_LOAD_STEADY);
     assert(!p.plugged);
-    assert(ar_extpower_update(&p, 4207, SOC, false, AR_LOAD_STEADY));
+    assert(ar_extpower_update(&p, 3991, SOC, false, AR_LOAD_STEADY));
     assert(p.plugged);
-    ar_extpower_update(&p, 4208, SOC, false, AR_LOAD_STEADY);
+    ar_extpower_update(&p, 3992, SOC, false, AR_LOAD_STEADY);
     assert(!p.plugged);   // 同一次跳变只报一次
 
     // 恒压段末尾拔掉、降幅不到 AR_PWR_TERM_MAX_MV,被当成充满停充:判定同样过时,再插上也要报
@@ -576,6 +579,39 @@ static void test_extpower_step_soon_after_load_change(void) {
     ar_extpower_update(&p, 4148, SOC, false, AR_LOAD_CHANGED);
     ar_extpower_update(&p, 4148, SOC, false, AR_LOAD_CHANGED);
     assert(feed_until(&p, noise, LEN(noise), true) == -1);
+}
+
+static void test_extpower_backlight_change_on_power(void) {
+    // 接着电源时负载由充电器带:2026-11-10 实测停充后背光在 0、20、80、100% 之间切换,
+    // 电池电压不变(±1 mV)。所以接着电源时背光变化不重置基准,插上亮屏后马上拔掉
+    // (拔掉正好落在亮屏引起的两个负载变化点里)也要认出来
+    static const int battery[] = {4140, 4140, 4141, 4140, 4139, 4140, 4140, 4140};
+    ar_extpower_t p;
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    ar_extpower_update(&p, 4205, SOC, false, AR_LOAD_STEADY);
+    assert(ar_extpower_update(&p, 4206, SOC, false, AR_LOAD_STEADY));
+    ar_extpower_update(&p, 4141, SOC, false, AR_LOAD_CHANGED);
+    assert(!ar_extpower_update(&p, 4140, SOC, false, AR_LOAD_CHANGED));
+
+    // 停充后(降幅只有负载那一份,约 16 mV)同样:亮屏的两点里拔掉,第二点判定断开
+    static const int cv[] = {4215, 4215, 4216, 4215, 4215, 4215, 4216, 4215};
+    static const int term[] = {4167, 4166, 4166, 4165, 4165, 4165, 4164, 4165};
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, cv, LEN(cv));
+    assert(feed(&p, term, LEN(term)));   // 停充,仍接着电源
+    ar_extpower_update(&p, 4149, SOC, false, AR_LOAD_CHANGED);
+    assert(!ar_extpower_update(&p, 4148, SOC, false, AR_LOAD_CHANGED));
+
+    // 接着电源时背光变化前后电压不变:不判成插拔,也不重复报插上
+    ar_extpower_init(&p);
+    feed(&p, battery, LEN(battery));
+    feed(&p, cv, LEN(cv));
+    for (int i = 0; i < 6; i++) {
+        assert(ar_extpower_update(&p, 4215, SOC, false, i < 2 ? AR_LOAD_CHANGED : AR_LOAD_STEADY));
+        assert(!p.plugged);
+    }
 }
 
 static void test_any_key_wakes_dark_screen(void) {
@@ -1062,6 +1098,7 @@ int main(void) {
     test_extpower_soc_fallback();
     test_extpower_plug_step_reported();
     test_extpower_step_soon_after_load_change();
+    test_extpower_backlight_change_on_power();
     test_any_key_wakes_dark_screen();
     test_notice_events();
     test_chime_rules();

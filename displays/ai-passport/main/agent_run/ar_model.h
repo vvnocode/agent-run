@@ -350,7 +350,8 @@ typedef enum {
 // 都要和插拔区分开
 typedef enum {
     AR_LOAD_STEADY = 0,    // 负载没变
-    AR_LOAD_CHANGED,       // 负载变了(背光变化):丢掉旧基准,以新电平重新开始
+    AR_LOAD_CHANGED,       // 负载变了(背光变化):电池供电时丢掉旧基准,以新电平重新开始;接着电源时
+                           // 负载由充电器带,电池电压不受影响,照常判断
     AR_LOAD_TRANSIENT,     // 短暂负载(提示音):这一点不计入
 } ar_load_t;
 
