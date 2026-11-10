@@ -42,6 +42,21 @@ class EncodeStateTest(unittest.TestCase):
         waiting = [("claude", "A")] * 99
         s = Snapshot(cc=99, cx=99, ds=99, done=999, wn=99, waiting=waiting)
         self.assertLessEqual(len(encode_state(s, 65535).encode("ascii")), MAX_LINE)
+        self.assertLessEqual(len(encode_state(s, 65535, minute=1439).encode("ascii")), MAX_LINE)
+
+    def test_local_minute_appended(self):
+        # 屏幕方案 §8：tm 为本地时间的当日分钟数，放在行尾，供设备判断夜间勿扰
+        s = snap(cc=3, cx=1, ds=1, done=21, waiting=[("claude", "A"), ("codex", "Q")])
+        self.assertEqual(
+            encode_state(s, 17, minute=1342),
+            "AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q tm=1342\n",
+        )
+        self.assertTrue(encode_state(snap(), 0, minute=0).endswith(" w=- tm=0\n"))
+
+    def test_invalid_minute_omitted(self):
+        # 取不到或超出 0–1439 时省略字段，设备按时间未知处理，而不是整帧丢弃
+        for minute in (None, -1, 1440, 99999):
+            self.assertNotIn(" tm=", encode_state(snap(), 0, minute=minute))
 
 
 class EncodeAgentTest(unittest.TestCase):

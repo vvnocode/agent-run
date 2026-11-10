@@ -19,10 +19,17 @@ def _clamp(value, upper):
     return max(0, min(upper, int(value)))
 
 
-def encode_state(snap, seq):
+# 本地时间字段 tm 的取值上限：当日分钟数 0–1439
+MAX_MINUTE = 1439
+
+
+def encode_state(snap, seq, minute=None):
     """把快照编码成一行状态帧，例如：
 
-    AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q
+    AR1 S seq=17 cc=3 cx=1 ds=1 done=21 wn=2 w=CC:A,CX:Q tm=1342
+
+    minute 为本地时间的当日分钟数（时 × 60 + 分），供设备判断夜间勿扰（屏幕方案 §8）；
+    为 None 或超出 0–1439 时省略 tm 字段，设备按时间未知处理。
     """
     items = []
     for tool, reason in snap.waiting:
@@ -32,7 +39,8 @@ def encode_state(snap, seq):
         if code and reason in ("A", "Q"):
             items.append("%s:%s" % (code, reason))
     waiting = ",".join(items) if items else "-"
-    return "AR1 S seq=%d cc=%d cx=%d ds=%d done=%d wn=%d w=%s\n" % (
+    tm = " tm=%d" % minute if minute is not None and 0 <= minute <= MAX_MINUTE else ""
+    return "AR1 S seq=%d cc=%d cx=%d ds=%d done=%d wn=%d w=%s%s\n" % (
         int(seq) % 65536,
         _clamp(snap.cc, 99),
         _clamp(snap.cx, 99),
@@ -40,6 +48,7 @@ def encode_state(snap, seq):
         _clamp(snap.done, 999),
         _clamp(snap.wn, 99),
         waiting,
+        tm,
     )
 
 

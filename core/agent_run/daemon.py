@@ -355,8 +355,9 @@ class Daemon:
                 self._last_agent = {}
 
     def _send(self, snap, now):
-        """发送一帧状态；写失败时断开链路，等待下次重连。"""
-        line = encode_state(snap, self._seq)
+        """发送一帧状态；写失败时断开链路，等待下次重连。帧里附带本地时间的当日分钟数。"""
+        local = time.localtime(now)
+        line = encode_state(snap, self._seq, minute=local.tm_hour * 60 + local.tm_min)
         if self._link.write_line(line):
             self._seq = (self._seq + 1) % 65536
             self._last_sent = snap
