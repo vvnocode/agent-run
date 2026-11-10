@@ -1,8 +1,9 @@
 // main/agent_run/ar_model.h —— Agent Run! 画面选择与交互规则(纯 C,可宿主测试)。
 //
 // 把“收到的状态 + 时间”换算成要显示的画面、动画帧间隔、速度条格数、
-// 通知与提示音、音量、亮度、设置菜单与背光,以及工具专用页面的切换与文字。
-// 规则见设计方案 §7.2、§7.5、无线方案 §4.4、§7.4 与专用页面方案 §4。
+// 通知与提示音、再提醒、音量、亮度、熄屏时间、勿扰与本地时间、设置菜单与背光,
+// 以及工具专用页面的切换与文字。
+// 规则见设计方案 §7.2、§7.5、无线方案 §4.4、§7.4、专用页面方案 §4 与屏幕方案(-screen-dnd-design.md)。
 #pragma once
 
 #include <stdbool.h>
@@ -18,12 +19,28 @@
 // 低亮度的背光百分比(设定亮度更低时用设定值)
 #define AR_DIM_PERCENT 20
 
-// 插着 USB 主机时:最近一次亮屏事件后多久降到低亮度、多久熄屏(保护屏幕与背光)
+// 插着 USB 主机时:最近一次亮屏事件后最晚多久降到低亮度;熄屏时间短于它的两倍时,
+// 改在熄屏时间的一半调暗。熄屏时间由用户设定,见 ar_usb_off_ms()
 #define AR_USB_DIM_AFTER_MS 300000u
-#define AR_USB_OFF_AFTER_MS 1800000u
 
-// 电池供电时:亮屏期间一直用低亮度,最近一次亮屏事件后多久熄屏
-#define AR_BATTERY_OFF_AFTER_MS 30000u
+// 熄屏时间的设定选项(存的是选项序号)。电池供电时亮屏期间一直用低亮度。
+// 电池供电:10 秒、30 秒、1 分、3 分;接电脑:5 分、10 分、30 分、1 小时、不熄屏。
+// 默认值与改版前的固定时限相同(30 秒、30 分钟)
+#define AR_BATTERY_OFF_OPTIONS 4
+#define AR_BATTERY_OFF_DEFAULT 1
+#define AR_USB_OFF_OPTIONS 5
+#define AR_USB_OFF_DEFAULT 2
+// “不熄屏”对应的时限
+#define AR_OFF_NEVER UINT32_MAX
+
+// 等你处理持续这么久没处理就再提醒一次(响一声并亮屏),每次新增等你处理后最多再提醒
+// AR_REMIND_MAX 次。见 ar_remind_update()
+#define AR_REMIND_AFTER_MS 180000u
+#define AR_REMIND_MAX 2
+
+// 夜间勿扰的时段(当日分钟数):22:00 起,到次日 08:00 止(不含 08:00)
+#define AR_NIGHT_START_MIN (22u * 60u)
+#define AR_NIGHT_END_MIN (8u * 60u)
 
 // 两次“等你处理”提示音的最小间隔
 #define AR_CHIME_MIN_INTERVAL_MS 30000u
@@ -156,6 +173,23 @@ void ar_chime_init(ar_chime_t *c);
 // - 静音时不响,也不计入间隔。
 ar_chime_kind_t ar_chime_pick(ar_chime_t *c, ar_notice_ev_t ev, uint32_t now_ms, bool muted);
 
+// 等你处理的再提醒状态
+typedef struct {
+    bool active;          // 正有等你处理在计时
+    uint8_t count;        // 本轮已再提醒的次数
+    uint32_t since_ms;    // 上一次提醒(新增或再提醒)的时刻
+} ar_remind_t;
+
+void ar_remind_init(ar_remind_t *r);
+
+// 每个周期调用一次,返回 true 表示该再提醒一次。wn 为当前等你处理数(链路不在线时传 0),
+// fresh 为本周期是否有新增等你处理(ar_notice_ev_t.waiting),now_ms 允许回绕:
+// - wn 为 0:清空,不提醒;
+// - 新增、或首次发现已在等待:从此刻重新计时、重新计次,不提醒(新增由普通提示音负责);
+// - 距上一次提醒满 AR_REMIND_AFTER_MS 且本轮次数未满 AR_REMIND_MAX:提醒并重新计时。
+// 处理了一部分(数量减少但不为 0)不算新增,沿用原来的计时与计次
+bool ar_remind_update(ar_remind_t *r, uint8_t wn, bool fresh, uint32_t now_ms);
+
 // 音量档位 → 播放音量百分比;越界按最高档
 uint8_t ar_volume_percent(uint8_t level);
 
@@ -168,6 +202,49 @@ uint8_t ar_brightness_percent(uint8_t level);
 // 加减亮度:到最低档与最高档时停住;越界先按最高档处理
 uint8_t ar_brightness_step(uint8_t level, int delta);
 
+// 熄屏时间选项 → 毫秒;越界按最后一项。接电脑的最后一项“不熄屏”返回 AR_OFF_NEVER
+uint32_t ar_battery_off_ms(uint8_t option);
+uint32_t ar_usb_off_ms(uint8_t option);
+
+// 加减选项序号(共 count 项):到头停住;越界先按最后一项处理
+uint8_t ar_option_step(uint8_t option, uint8_t count, int delta);
+
+// 开关类设置项的调节:上键(delta > 0)开启、下键关闭,delta 为 0 时不变。
+// 不做来回翻转,上下键连按被识别成双击时结果也确定
+bool ar_toggle_step(bool on, int delta);
+
+// 本地时间:主机在状态帧 tm 字段里同步的当日分钟数,之后按本机毫秒计数走时
+typedef struct {
+    bool known;          // 是否对过时
+    uint16_t minute;     // 对时那一刻的当日分钟数
+    uint32_t at_ms;      // 对时那一刻(收到那一帧)的本机毫秒数
+} ar_clock_t;
+
+void ar_clock_init(ar_clock_t *c);
+
+// 用主机的当日分钟数对时;minute 为 AR_TIME_UNKNOWN 或超过 AR_TIME_MAX_MIN 时不改变。
+// 每收到一帧都可以调用,以最新一帧为准
+void ar_clock_sync(ar_clock_t *c, uint16_t minute, uint32_t at_ms);
+
+// 取 now_ms 时刻的当日分钟数写入 *minute;还没对过时返回 false。now_ms 允许回绕
+bool ar_clock_minute(const ar_clock_t *c, uint32_t now_ms, uint16_t *minute);
+
+// 当日分钟数是否落在夜间时段 [AR_NIGHT_START_MIN, 24:00) ∪ [0, AR_NIGHT_END_MIN)
+bool ar_is_night(uint16_t minute);
+
+// 夜间勿扰此刻的状态,供二级页面的说明使用
+typedef enum {
+    AR_NIGHT_NO_TIME = 0,   // 还没对过时,夜间勿扰不生效
+    AR_NIGHT_ON,            // 在夜间时段内
+    AR_NIGHT_OFF,           // 不在夜间时段内
+} ar_night_t;
+
+ar_night_t ar_night_state(const ar_clock_t *c, uint32_t now_ms);
+
+// 勿扰是否生效:手动勿扰开着,或夜间勿扰开着且已知此刻在夜间时段内。
+// 生效期间不响任何提示音,通知与连上电脑不点亮屏幕(屏幕方案 §6.2)
+bool ar_dnd_active(bool manual, bool night_enabled, const ar_clock_t *c, uint32_t now_ms);
+
 // 设置菜单的层级
 typedef enum {
     AR_MENU_CLOSED = 0,   // 首页,菜单未打开
@@ -179,6 +256,10 @@ typedef enum {
 typedef enum {
     AR_MENU_VOLUME = 0,
     AR_MENU_BRIGHTNESS,
+    AR_MENU_BATTERY_OFF,   // 电池熄屏时间
+    AR_MENU_USB_OFF,       // 接电脑熄屏时间
+    AR_MENU_DND,           // 勿扰(手动开关)
+    AR_MENU_NIGHT,         // 夜间勿扰
     AR_MENU_ITEMS,
 } ar_menu_item_t;
 
@@ -214,7 +295,13 @@ typedef struct {
     uint8_t level;              // 用户设定的亮度档位
     uint32_t ms_since_wake;     // 距最近一次亮屏事件(按键、通知、连上电脑、配对确认、开机),从未发生传 UINT32_MAX
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
+    uint8_t battery_off;        // 电池供电的熄屏时间选项,见 ar_battery_off_ms()
+    uint8_t usb_off;            // 接电脑的熄屏时间选项,见 ar_usb_off_ms()
+    bool locked;                // 用户手动熄屏,到下一次亮屏事件为止
 } ar_backlight_in_t;
+
+// 手动熄屏(长按确定键)是否生效:设置菜单打开或正在配对确认时不响应
+bool ar_lock_allowed(bool menu_open, bool pairing);
 
 // 熄屏时按键亮屏。按键组件只在单击、双击、长按时发出动作事件,三连击、双击第二下按住
 // 超过 180 ms 等手势不发任何动作事件,所以亮屏以“按下”为准;亮屏的那次手势随后产生的
@@ -239,7 +326,7 @@ void ar_keywake_release(ar_keywake_t *k, uint32_t now_ms);
 // false 表示它属于亮屏那次手势,应当忽略
 bool ar_keywake_action(ar_keywake_t *k);
 
-// 供电方式跟踪。插着 USB 主机与电池供电的熄屏时限不同(30 分钟与 30 秒),
+// 供电方式跟踪。插着 USB 主机与电池供电的熄屏时限不同(默认 30 分钟与 30 秒),
 // 拔线瞬间若仍按最近一次亮屏事件计时,亮着的屏幕会立刻熄灭
 typedef struct {
     bool known;    // 是否已记录过供电方式
@@ -254,10 +341,11 @@ void ar_power_init(ar_power_t *p);
 bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on);
 
 // 背光百分比,0 表示熄屏。“低亮度”为 AR_DIM_PERCENT 与设定亮度中较低者。
-// - 电池供电:亮屏事件后 AR_BATTERY_OFF_AFTER_MS 内用低亮度,之后熄屏;
-// - 插着 USB 主机且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏;
-// - 插着 USB 主机:亮屏事件后 AR_USB_DIM_AFTER_MS 内用设定亮度,
-//   AR_USB_OFF_AFTER_MS 内用低亮度,之后熄屏。
+// - 手动熄屏后:到下一次亮屏事件前一直熄灭;
+// - 电池供电:亮屏事件后在电池熄屏时间内用低亮度,之后熄屏;
+// - 插着 USB 主机且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏(不受熄屏设置影响);
+// - 插着 USB 主机:亮屏事件后先用设定亮度,满 AR_USB_DIM_AFTER_MS 与熄屏时间一半中较短者
+//   降到低亮度,满接电脑熄屏时间熄屏;“不熄屏”时一直保持低亮度。
 uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in);
 
 // 深睡判定的输入

@@ -1,4 +1,5 @@
-// tests/test_ar_model.c —— Agent Run! 画面选择、链路超时、帧间隔、通知与提示音、音量、背光与深睡规则的宿主测试。
+// tests/test_ar_model.c —— Agent Run! 画面选择、链路超时、帧间隔、通知与提示音、再提醒、音量、熄屏时间、
+// 手动熄屏、勿扰与本地时间、背光与深睡规则的宿主测试。
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
@@ -94,10 +95,18 @@ static void test_menu_navigation(void) {
     // 单击确定打开一级菜单,默认选中音量
     assert(ar_menu_key(&m, AR_KEY_OK) == 0);
     assert(m.level == AR_MENU_LIST && m.item == AR_MENU_VOLUME);
-    // 上下键切换选中项,到头停住;一级菜单里不产生调节量
+    // 上下键切换选中项,到头停住;一级菜单里不产生调节量。顺序:音量、亮度、电池熄屏、
+    // 接电脑熄屏、勿扰、夜间勿扰(屏幕方案 §7 设计稿 A)
+    assert(AR_MENU_ITEMS == 6);
     assert(ar_menu_key(&m, AR_KEY_UP) == 0 && m.item == AR_MENU_VOLUME);
     assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_BRIGHTNESS);
-    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_BRIGHTNESS);
+    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_BATTERY_OFF);
+    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_USB_OFF);
+    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_DND);
+    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_NIGHT);
+    assert(ar_menu_key(&m, AR_KEY_DOWN) == 0 && m.item == AR_MENU_NIGHT);
+    for (int i = 0; i < 4; i++) ar_menu_key(&m, AR_KEY_UP);
+    assert(m.item == AR_MENU_BRIGHTNESS);
     // 单击确定进入二级,上下键给出对选中项的调节量
     assert(ar_menu_key(&m, AR_KEY_OK) == 0);
     assert(m.level == AR_MENU_ADJUST && m.item == AR_MENU_BRIGHTNESS);
@@ -118,8 +127,8 @@ static void test_menu_timeouts(void) {
     // 用户指定:一级菜单 10 秒、二级 3 秒没有按键就回首页
     assert(AR_MENU_LIST_TIMEOUT_MS == 10000u);
     assert(AR_MENU_ADJUST_TIMEOUT_MS == 3000u);
-    // 电池供电的熄屏晚于菜单超时,操作菜单期间屏幕不会灭
-    assert(AR_BATTERY_OFF_AFTER_MS > AR_MENU_LIST_TIMEOUT_MS);
+    // 电池供电时最短的熄屏时间也不早于菜单超时,操作菜单期间屏幕不会灭
+    assert(ar_battery_off_ms(0) >= AR_MENU_LIST_TIMEOUT_MS);
 
     ar_menu_t m;
     ar_menu_init(&m);
@@ -150,39 +159,86 @@ static ar_backlight_in_t backlight_in(ar_screen_t screen, bool usb_power) {
         .level = 3,
         .ms_since_wake = 0,
         .ms_disconnected = 0,
+        .battery_off = AR_BATTERY_OFF_DEFAULT,
+        .usb_off = AR_USB_OFF_DEFAULT,
+        .locked = false,
     };
     return in;
 }
 
 static void test_backlight_on_usb_power(void) {
-    // 插着 USB 主机:亮屏事件后 5 分钟内用设定亮度,之后降到低亮度,满 30 分钟熄屏
+    // 插着 USB 主机,默认 30 分钟熄屏:亮屏事件后 5 分钟内用设定亮度,之后降到低亮度,满 30 分钟熄屏
+    const uint32_t off = ar_usb_off_ms(AR_USB_OFF_DEFAULT);
+    assert(off == 1800000u);
     ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, true);
     in.ms_since_wake = AR_USB_DIM_AFTER_MS - 1;
     assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
     in.ms_since_wake = AR_USB_DIM_AFTER_MS;
     assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
-    in.ms_since_wake = AR_USB_OFF_AFTER_MS - 1;
+    in.ms_since_wake = off - 1;
     assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
-    in.ms_since_wake = AR_USB_OFF_AFTER_MS;
+    in.ms_since_wake = off;
     assert(ar_model_backlight_percent(&in) == 0);
     // 等你处理也按同一规则,靠通知亮屏重新点亮
     in = backlight_in(AR_SCREEN_WAITING, true);
-    in.ms_since_wake = AR_USB_OFF_AFTER_MS;
+    in.ms_since_wake = off;
     assert(ar_model_backlight_percent(&in) == 0);
-    assert(AR_USB_DIM_AFTER_MS < AR_USB_OFF_AFTER_MS);
+
+    // 5 分钟熄屏:熄屏时间的一半(2.5 分钟)就调暗,免得没有低亮度阶段
+    in = backlight_in(AR_SCREEN_RUN, true);
+    in.usb_off = 0;
+    assert(ar_usb_off_ms(0) == 300000u);
+    in.ms_since_wake = 150000u - 1;
+    assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
+    in.ms_since_wake = 150000u;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = 300000u;
+    assert(ar_model_backlight_percent(&in) == 0);
+
+    // 1 小时熄屏:仍是 5 分钟后调暗,满 1 小时熄屏
+    in.usb_off = 3;
+    in.ms_since_wake = AR_USB_DIM_AFTER_MS;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = 3600000u - 1;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = 3600000u;
+    assert(ar_model_backlight_percent(&in) == 0);
+
+    // 不熄屏:5 分钟后调暗,之后一直保持低亮度
+    in.usb_off = AR_USB_OFF_OPTIONS - 1;
+    assert(ar_usb_off_ms(in.usb_off) == AR_OFF_NEVER);
+    in.ms_since_wake = AR_USB_DIM_AFTER_MS - 1;
+    assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
+    in.ms_since_wake = 3600000u * 24u;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = NEVER;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
 }
 
 static void test_backlight_on_battery(void) {
-    // 电池供电:亮屏期间直接用低亮度,亮屏事件后 30 秒熄屏
+    // 电池供电,默认 30 秒熄屏:亮屏期间直接用低亮度,亮屏事件后 30 秒熄屏
+    const uint32_t off = ar_battery_off_ms(AR_BATTERY_OFF_DEFAULT);
+    assert(off == 30000u);
     ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, false);
     assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
-    in.ms_since_wake = AR_BATTERY_OFF_AFTER_MS - 1;
+    in.ms_since_wake = off - 1;
     assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
-    in.ms_since_wake = AR_BATTERY_OFF_AFTER_MS;
+    in.ms_since_wake = off;
+    assert(ar_model_backlight_percent(&in) == 0);
+    // 其他选项:10 秒、3 分钟
+    in.battery_off = 0;
+    in.ms_since_wake = 10000u - 1;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = 10000u;
+    assert(ar_model_backlight_percent(&in) == 0);
+    in.battery_off = AR_BATTERY_OFF_OPTIONS - 1;
+    in.ms_since_wake = 180000u - 1;
+    assert(ar_model_backlight_percent(&in) == AR_DIM_PERCENT);
+    in.ms_since_wake = 180000u;
     assert(ar_model_backlight_percent(&in) == 0);
     // 等你处理与未连接同样适用
     in = backlight_in(AR_SCREEN_WAITING, false);
-    in.ms_since_wake = AR_BATTERY_OFF_AFTER_MS;
+    in.ms_since_wake = off;
     assert(ar_model_backlight_percent(&in) == 0);
     in = backlight_in(AR_SCREEN_DISCONNECTED, false);
     in.ms_disconnected = 1000;
@@ -513,6 +569,187 @@ static void test_usage_alert(void) {
     assert(!ar_usage_alert(AR_USAGE_NO_LIMIT));
 }
 
+static void test_screen_off_options(void) {
+    // 电池供电:10 秒、30 秒、1 分、3 分,默认 30 秒(与改版前相同)
+    static const uint32_t battery[] = { 10000u, 30000u, 60000u, 180000u };
+    assert(AR_BATTERY_OFF_OPTIONS == 4);
+    for (uint8_t i = 0; i < AR_BATTERY_OFF_OPTIONS; i++) assert(ar_battery_off_ms(i) == battery[i]);
+    assert(AR_BATTERY_OFF_DEFAULT == 1);
+    // 接电脑:5 分、10 分、30 分、1 小时、不熄屏,默认 30 分(与改版前相同)
+    static const uint32_t usb[] = { 300000u, 600000u, 1800000u, 3600000u, AR_OFF_NEVER };
+    assert(AR_USB_OFF_OPTIONS == 5);
+    for (uint8_t i = 0; i < AR_USB_OFF_OPTIONS; i++) assert(ar_usb_off_ms(i) == usb[i]);
+    assert(AR_USB_OFF_DEFAULT == 2);
+    // 越界按最后一项处理,与音量、亮度一致
+    assert(ar_battery_off_ms(200) == 180000u);
+    assert(ar_usb_off_ms(200) == AR_OFF_NEVER);
+
+    // 选项加减:到头停住;越界先按最后一项处理
+    assert(ar_option_step(1, AR_BATTERY_OFF_OPTIONS, +1) == 2);
+    assert(ar_option_step(3, AR_BATTERY_OFF_OPTIONS, +1) == 3);
+    assert(ar_option_step(0, AR_BATTERY_OFF_OPTIONS, -1) == 0);
+    assert(ar_option_step(2, AR_USB_OFF_OPTIONS, -2) == 0);
+    assert(ar_option_step(9, AR_USB_OFF_OPTIONS, 0) == 4);
+    assert(ar_option_step(9, AR_USB_OFF_OPTIONS, -1) == 3);
+}
+
+static void test_manual_lock(void) {
+    // 手动熄屏:直到下一次亮屏事件前一直熄灭,不论供电方式、熄屏设置与画面
+    ar_backlight_in_t in = backlight_in(AR_SCREEN_RUN, true);
+    in.locked = true;
+    assert(ar_model_backlight_percent(&in) == 0);
+    in.usb_off = AR_USB_OFF_OPTIONS - 1;   // 不熄屏也照样熄灭
+    assert(ar_model_backlight_percent(&in) == 0);
+    in = backlight_in(AR_SCREEN_WAITING, false);
+    in.locked = true;
+    assert(ar_model_backlight_percent(&in) == 0);
+    in = backlight_in(AR_SCREEN_DISCONNECTED, true);
+    in.locked = true;
+    assert(ar_model_backlight_percent(&in) == 0);
+    // 解除后按原规则点亮
+    in.locked = false;
+    assert(ar_model_backlight_percent(&in) == ar_brightness_percent(3));
+
+    // 只在菜单关着、不在配对确认时生效
+    assert(ar_lock_allowed(false, false));
+    assert(!ar_lock_allowed(true, false));
+    assert(!ar_lock_allowed(false, true));
+}
+
+static void test_toggle_step(void) {
+    // 勿扰类开关:上键开启、下键关闭,连按(双击)也不会来回翻转
+    assert(ar_toggle_step(false, +1));
+    assert(ar_toggle_step(true, +2));
+    assert(!ar_toggle_step(true, -1));
+    assert(!ar_toggle_step(false, -2));
+    assert(ar_toggle_step(true, 0) && !ar_toggle_step(false, 0));
+}
+
+static void test_local_clock(void) {
+    ar_clock_t c;
+    ar_clock_init(&c);
+    uint16_t minute = 0;
+    // 还没对过时:时间未知
+    assert(!ar_clock_minute(&c, 1000, &minute));
+    // 主机没带 tm 或越界时不对时
+    ar_clock_sync(&c, AR_TIME_UNKNOWN, 1000);
+    ar_clock_sync(&c, 1440, 1000);
+    assert(!ar_clock_minute(&c, 1000, &minute));
+
+    // 对时后按本机毫秒计数走时,满一分钟进一
+    ar_clock_sync(&c, 21 * 60 + 59, 5000);
+    assert(ar_clock_minute(&c, 5000, &minute) && minute == 21 * 60 + 59);
+    assert(ar_clock_minute(&c, 5000 + 59999, &minute) && minute == 21 * 60 + 59);
+    assert(ar_clock_minute(&c, 5000 + 60000, &minute) && minute == 22 * 60);
+    // 跨午夜回到 0
+    ar_clock_sync(&c, 1439, 0);
+    assert(ar_clock_minute(&c, 60000, &minute) && minute == 0);
+    assert(ar_clock_minute(&c, 60000u * 61u, &minute) && minute == 60);
+    // 走满一整天回到同一分钟,再多一分钟进到次日 0 点
+    assert(ar_clock_minute(&c, 60000u * 1440u, &minute) && minute == 1439);
+    assert(ar_clock_minute(&c, 60000u * 1441u, &minute) && minute == 0);
+    // 毫秒计数回绕时按无符号差值计算
+    ar_clock_sync(&c, 600, 0xFFFFFF00u);
+    assert(ar_clock_minute(&c, 0xFFFFFF00u + 120000u, &minute) && minute == 602);
+    // 重新对时以新值为准(Mac 改了时间或时区)
+    ar_clock_sync(&c, 100, 0x10000000u);
+    assert(ar_clock_minute(&c, 0x10000000u, &minute) && minute == 100);
+}
+
+static void test_night_window(void) {
+    // 用户指定:夜间为 22:00–08:00,含 22:00,不含 08:00
+    assert(!ar_is_night(21 * 60 + 59));
+    assert(ar_is_night(22 * 60));
+    assert(ar_is_night(23 * 60 + 59));
+    assert(ar_is_night(0));
+    assert(ar_is_night(7 * 60 + 59));
+    assert(!ar_is_night(8 * 60));
+    assert(!ar_is_night(12 * 60));
+}
+
+static void test_dnd(void) {
+    ar_clock_t c;
+    ar_clock_init(&c);
+    // 手动勿扰:不需要时间,一直生效
+    assert(ar_dnd_active(true, false, &c, 0));
+    assert(!ar_dnd_active(false, false, &c, 0));
+    // 夜间勿扰:还没对时不生效,状态为“未同步时间”
+    assert(!ar_dnd_active(false, true, &c, 0));
+    assert(ar_night_state(&c, 0) == AR_NIGHT_NO_TIME);
+    // 对时后按时段生效
+    ar_clock_sync(&c, 23 * 60, 0);
+    assert(ar_dnd_active(false, true, &c, 0));
+    assert(ar_night_state(&c, 0) == AR_NIGHT_ON);
+    assert(!ar_dnd_active(false, false, &c, 0));   // 夜间勿扰关着时不生效
+    ar_clock_sync(&c, 8 * 60, 0);
+    assert(!ar_dnd_active(false, true, &c, 0));
+    assert(ar_night_state(&c, 0) == AR_NIGHT_OFF);
+    // 走时跨进夜间时段后自动生效
+    ar_clock_sync(&c, 21 * 60 + 59, 0);
+    assert(!ar_dnd_active(false, true, &c, 0));
+    assert(ar_dnd_active(false, true, &c, 60000));
+    // 两个开关独立:手动勿扰开着时不看时间
+    assert(ar_dnd_active(true, true, &c, 0));
+}
+
+static void test_waiting_remind(void) {
+    // 用户指定:等你处理超过 3 分钟没处理就再提醒,最多再提醒 2 次
+    assert(AR_REMIND_AFTER_MS == 180000u);
+    assert(AR_REMIND_MAX == 2);
+    // 再提醒的间隔长于等你处理提示音的节流间隔,不会被它压住
+    assert(AR_REMIND_AFTER_MS > AR_CHIME_MIN_INTERVAL_MS);
+
+    ar_remind_t r;
+    ar_remind_init(&r);
+    assert(!ar_remind_update(&r, 0, false, 1000));
+    // 新增等你处理:本身由普通提示音负责,这里只开始计时
+    const uint32_t t0 = 5000;
+    assert(!ar_remind_update(&r, 1, true, t0));
+    assert(!ar_remind_update(&r, 1, false, t0 + AR_REMIND_AFTER_MS - 1));
+    assert(ar_remind_update(&r, 1, false, t0 + AR_REMIND_AFTER_MS));             // 第 1 次再提醒
+    assert(!ar_remind_update(&r, 1, false, t0 + AR_REMIND_AFTER_MS + 1));
+    assert(!ar_remind_update(&r, 1, false, t0 + 2 * AR_REMIND_AFTER_MS - 1));
+    assert(ar_remind_update(&r, 1, false, t0 + 2 * AR_REMIND_AFTER_MS));         // 第 2 次再提醒
+    // 到上限后不再提醒,无论等多久
+    assert(!ar_remind_update(&r, 1, false, t0 + 3 * AR_REMIND_AFTER_MS));
+    assert(!ar_remind_update(&r, 1, false, t0 + 20 * AR_REMIND_AFTER_MS));
+
+    // 处理完(数量归零)后重新开始;再次出现的等你处理重新计次
+    assert(!ar_remind_update(&r, 0, false, 2000000));
+    assert(!ar_remind_update(&r, 1, true, 2000000));
+    assert(ar_remind_update(&r, 1, false, 2000000 + AR_REMIND_AFTER_MS));
+
+    // 处理了一部分(2 → 1,不是新增):继续原来的计时与计次
+    ar_remind_init(&r);
+    assert(!ar_remind_update(&r, 2, true, 0));
+    assert(!ar_remind_update(&r, 1, false, 60000));
+    assert(ar_remind_update(&r, 1, false, AR_REMIND_AFTER_MS));
+
+    // 等待期间又新增一项(1 → 2):重新计时,并重新给足 2 次
+    ar_remind_init(&r);
+    assert(!ar_remind_update(&r, 1, true, 0));
+    assert(ar_remind_update(&r, 1, false, AR_REMIND_AFTER_MS));
+    assert(ar_remind_update(&r, 1, false, 2 * AR_REMIND_AFTER_MS));
+    const uint32_t t1 = 2 * AR_REMIND_AFTER_MS + 30000;
+    assert(!ar_remind_update(&r, 2, true, t1));
+    assert(!ar_remind_update(&r, 2, false, t1 + AR_REMIND_AFTER_MS - 1));
+    assert(ar_remind_update(&r, 2, false, t1 + AR_REMIND_AFTER_MS));
+    assert(ar_remind_update(&r, 2, false, t1 + 2 * AR_REMIND_AFTER_MS));
+    assert(!ar_remind_update(&r, 2, false, t1 + 3 * AR_REMIND_AFTER_MS));
+
+    // 没有“新增”就已经在等(开机或掉线恢复时已有等待项):从此刻开始计时,不立刻提醒
+    ar_remind_init(&r);
+    assert(!ar_remind_update(&r, 1, false, 7000));
+    assert(!ar_remind_update(&r, 1, false, 7000 + AR_REMIND_AFTER_MS - 1));
+    assert(ar_remind_update(&r, 1, false, 7000 + AR_REMIND_AFTER_MS));
+
+    // 毫秒计数回绕时按无符号差值计算
+    ar_remind_init(&r);
+    assert(!ar_remind_update(&r, 1, true, 0xFFFFFF00u));
+    assert(!ar_remind_update(&r, 1, false, 0x00000100u));
+    assert(ar_remind_update(&r, 1, false, 0xFFFFFF00u + AR_REMIND_AFTER_MS));
+}
+
 int main(void) {
     test_page_cycle();
     test_page_priority_and_keys();
@@ -532,7 +769,14 @@ int main(void) {
     test_any_key_wakes_dark_screen();
     test_notice_events();
     test_chime_rules();
+    test_waiting_remind();
     test_volume();
+    test_screen_off_options();
+    test_manual_lock();
+    test_toggle_step();
+    test_local_clock();
+    test_night_window();
+    test_dnd();
     test_deep_sleep_after_long_disconnect_on_battery();
     test_power_off_after_dark_hour_on_battery();
     test_no_deep_sleep_when_powered_or_pairing();

@@ -168,6 +168,16 @@ class DaemonTest(unittest.TestCase):
         fields = frame_fields(self.link().lines[-1])
         self.assertEqual(fields["cc"], "1")
 
+    def test_state_frame_carries_local_minute(self):
+        # 屏幕方案 §8：每帧状态（含心跳）都带本地时间的当日分钟数
+        self.daemon.step()
+        t = time.localtime(self.clock.t)
+        self.assertEqual(frame_fields(self.link().lines[-1])["tm"], str(t.tm_hour * 60 + t.tm_min))
+        self.clock.t += 125.0
+        self.daemon.step()
+        t = time.localtime(self.clock.t)
+        self.assertEqual(frame_fields(self.link().lines[-1])["tm"], str(t.tm_hour * 60 + t.tm_min))
+
     def test_heartbeat_every_two_seconds(self):
         self.daemon.step()
         sent = len(self.link().lines)

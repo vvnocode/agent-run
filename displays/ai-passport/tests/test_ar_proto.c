@@ -24,6 +24,25 @@ static void test_valid_frame(void) {
     assert(st.w_count == 2);
     assert(st.w[0].tool == AR_TOOL_CC && st.w[0].reason == AR_REASON_APPROVE);
     assert(st.w[1].tool == AR_TOOL_CX && st.w[1].reason == AR_REASON_QUESTION);
+    // 没有 tm 字段:本地时间未知
+    assert(st.tm == AR_TIME_UNKNOWN);
+}
+
+static void test_local_minute(void) {
+    // tm 为主机本地时间的当日分钟数 0–1439,可选(屏幕方案 §8)
+    ar_state_t st;
+    assert(ar_proto_parse_line("AR1 S seq=3 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=1342", &st) == AR_LINE_STATE);
+    assert(st.tm == 1342);
+    assert(ar_proto_parse_line("AR1 S seq=4 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=0", &st) == AR_LINE_STATE);
+    assert(st.tm == 0);
+    assert(ar_proto_parse_line("AR1 S seq=5 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=1439", &st) == AR_LINE_STATE);
+    assert(st.tm == 1439);
+    // 出现但越界或格式错误时整帧丢弃,与其他字段一致
+    memset(&st, 0xAB, sizeof(st));
+    assert(ar_proto_parse_line("AR1 S seq=6 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=1440", &st) == AR_LINE_IGNORED);
+    assert(ar_proto_parse_line("AR1 S seq=6 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=-1", &st) == AR_LINE_IGNORED);
+    assert(ar_proto_parse_line("AR1 S seq=6 cc=0 cx=0 ds=0 done=0 wn=0 w=- tm=", &st) == AR_LINE_IGNORED);
+    assert(st.seq == 0xABAB);
 }
 
 static void test_empty_wait_list_and_unknown_keys(void) {
@@ -164,6 +183,7 @@ int main(void) {
     test_agent_plan();
     test_invalid_agent_frames_do_not_touch_output();
     test_valid_frame();
+    test_local_minute();
     test_empty_wait_list_and_unknown_keys();
     test_invalid_frames_do_not_touch_output();
     test_ping();

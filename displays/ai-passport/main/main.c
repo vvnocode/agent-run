@@ -12,18 +12,23 @@
 //          确定 单击  打开设置菜单(一级:音量、亮度,默认选中音量)
 //          下 / 上    依次切换 首页 → Claude Code → Codex → 首页(上键反向),见 ar_page_step();
 //                     等你处理、未连接时不切页,这两种画面优先显示,清空后回到所在页面
-//   一级   上 / 下    切换选中项;确定单击进入二级;确定双击回首页;10 秒无按键回首页
-//   二级   上 / 下    调节并保存(调音量时按新音量试听,调亮度时按设定亮度点亮);
-//                     确定双击回一级;3 秒无按键回首页
+//   一级   上 / 下    切换选中项(音量、亮度、电池熄屏、接电脑熄屏、勿扰、夜间勿扰);
+//                     确定单击进入二级;确定双击回首页;10 秒无按键回首页
+//   二级   上 / 下    调节并保存(调音量时按新音量试听,调亮度时按设定亮度点亮;
+//                     勿扰与夜间勿扰上键开启、下键关闭);确定双击回一级;3 秒无按键回首页
 //   上     按住 5 秒 清除蓝牙配对
+//   确定   长按      立即熄屏(菜单打开、配对确认时不响应),到下一次亮屏事件为止
 //   配对确认时       确定 = 接受,下 = 拒绝
 //   任意键           背光关闭时按下即亮屏,这次手势不执行按键操作;深睡时唤醒设备(重新启动)
 //
-// 亮屏与熄屏:按键、通知(等你处理增加、有会话完成)、连上电脑、配对确认都会点亮屏幕,
-// 之后按供电方式调暗、熄屏,规则见 ar_model_backlight_percent()。拔掉 USB 时屏幕若亮着,
-// 也算一次亮屏事件,见 ar_power_update()。
+// 亮屏与熄屏:按键、通知(等你处理增加、有会话完成、等你处理 3 分钟未处理的再提醒)、
+// 连上电脑、配对确认都会点亮屏幕,之后按供电方式与熄屏时间设置调暗、熄屏,
+// 规则见 ar_model_backlight_percent()。拔掉 USB 时屏幕若亮着,也算一次亮屏事件,
+// 见 ar_power_update()。
 // 电池供电时,“未连接”且无按键满 30 分钟,或熄屏满 1 小时,进入深睡(关机,按任意键唤醒),
 // 规则见 ar_model_should_deep_sleep()。
+// 勿扰(手动开启,或夜间勿扰开启且主机同步的本地时间在 22:00–08:00)生效时不响任何提示音,
+// 通知与连上电脑不点亮屏幕,规则见 ar_dnd_active() 与屏幕方案 §6。
 #include <string.h>
 
 #include "agent_run/ar_ble.h"
@@ -95,6 +100,13 @@ static int64_t s_up_pressed_us;             // 上键按下的时刻,0 表示没
 static int64_t s_cleared_until_us;          // “已清除配对”提示的截止时刻
 static ar_notice_t s_notice;
 static ar_chime_t s_chime;
+static ar_remind_t s_remind;                // 等你处理长时间未处理的再提醒
+static uint8_t s_battery_off;               // 电池供电的熄屏时间选项
+static uint8_t s_usb_off;                   // 接电脑的熄屏时间选项
+static bool s_locked;                       // 用户长按确定键手动熄屏,到下一次亮屏事件为止
+static bool s_dnd;                          // 勿扰(手动)开关
+static bool s_night;                        // 夜间勿扰开关
+static ar_clock_t s_clock;                  // 主机同步的本地时间,供夜间勿扰判断
 static uint16_t s_done_flash_count;         // “完成 +N”里的 N,提示期间新完成的轮数累加
 static ar_menu_t s_menu;                    // 设置菜单的层级与选中项
 static int64_t s_done_flash_until_us;       // “完成 +N”提示的截止时刻
@@ -115,6 +127,12 @@ static uint32_t ms_since(int64_t from_us, int64_t now_us) {
     return (uint32_t)d;
 }
 
+// 记一次亮屏事件,同时解除手动熄屏
+static void wake(int64_t now_us) {
+    s_last_wake_us = now_us;
+    s_locked = false;
+}
+
 // 按键回调运行在共享的 esp_timer 任务里:只入队,立刻返回
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
@@ -125,7 +143,8 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-// 二级菜单里按调节量修改选中项并保存;到头时不变,但音量仍试听一声,确认当前档位(静音档不响)
+// 二级菜单里按调节量修改选中项并保存;到头时不变,但音量仍试听一声,确认当前档位(静音档不响)。
+// 熄屏时间按选项加减,勿扰类开关上键开启、下键关闭
 static void apply_adjust(uint8_t item, int delta) {
     if (item == AR_MENU_VOLUME) {
         const uint8_t volume = ar_volume_step(s_volume, delta);
@@ -141,6 +160,32 @@ static void apply_adjust(uint8_t item, int delta) {
             s_brightness = brightness;
             ar_settings_save_brightness(s_brightness);
         }
+    } else if (item == AR_MENU_BATTERY_OFF) {
+        const uint8_t option = ar_option_step(s_battery_off, AR_BATTERY_OFF_OPTIONS, delta);
+        if (option != s_battery_off) {
+            s_battery_off = option;
+            ar_settings_save_battery_off(option);
+        }
+    } else if (item == AR_MENU_USB_OFF) {
+        const uint8_t option = ar_option_step(s_usb_off, AR_USB_OFF_OPTIONS, delta);
+        if (option != s_usb_off) {
+            s_usb_off = option;
+            ar_settings_save_usb_off(option);
+        }
+    } else if (item == AR_MENU_DND) {
+        const bool on = ar_toggle_step(s_dnd, delta);
+        if (on != s_dnd) {
+            s_dnd = on;
+            ar_settings_save_dnd(on);
+            ESP_LOGI(TAG, "勿扰 %s", on ? "开启" : "关闭");
+        }
+    } else if (item == AR_MENU_NIGHT) {
+        const bool on = ar_toggle_step(s_night, delta);
+        if (on != s_night) {
+            s_night = on;
+            ar_settings_save_night(on);
+            ESP_LOGI(TAG, "夜间勿扰 %s", on ? "开启" : "关闭");
+        }
     }
 }
 
@@ -152,7 +197,7 @@ static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
     if (in->event == BSP_BTN_PRESS) {
         ar_keywake_press(&s_keywake, s_backlight == 0, now_ms);
         s_last_key_us = now_us;
-        s_last_wake_us = now_us;
+        wake(now_us);
         // 上键按住 5 秒清除配对:按 PRESS 与 RELEASE 的间隔计时
         if (in->btn == BSP_BTN_UP) s_up_pressed_us = now_us;
         return;
@@ -168,11 +213,10 @@ static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
         }
         return;
     }
-    // 长按目前不分配功能,但仍算按键:推迟熄屏与深睡
     if (in->event != BSP_BTN_CLICK && in->event != BSP_BTN_DOUBLE && in->event != BSP_BTN_LONG) return;
 
     s_last_key_us = now_us;
-    s_last_wake_us = now_us;
+    wake(now_us);
     if (!ar_keywake_action(&s_keywake)) return;   // 亮屏那次手势的动作不执行
 
     if (pairing) {
@@ -180,7 +224,14 @@ static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
         else if (in->event == BSP_BTN_CLICK && in->btn == BSP_BTN_DOWN) ar_ble_pair_key(false);
         return;
     }
-    if (in->event == BSP_BTN_LONG) return;
+    // 长按确定键立即熄屏;其余长按不分配功能,但仍算按键,推迟熄屏与深睡
+    if (in->event == BSP_BTN_LONG) {
+        if (in->btn == BSP_BTN_OK && ar_lock_allowed(s_menu.level != AR_MENU_CLOSED, pairing)) {
+            s_locked = true;
+            ESP_LOGI(TAG, "手动熄屏");
+        }
+        return;
+    }
 
     // 菜单未打开、画面为普通画面时,上下键切换页面;双击按两步处理,与菜单里一致
     if ((in->btn == BSP_BTN_UP || in->btn == BSP_BTN_DOWN) &&
@@ -207,6 +258,16 @@ static void handle_key(const input_event_t *in, int64_t now_us, bool pairing) {
     int delta = 0;
     for (int i = 0; i < presses; i++) delta += ar_menu_key(&s_menu, key);
     if (delta != 0) apply_adjust(s_menu.item, delta);
+}
+
+// 记录 LVGL 内存池用量,调用方须持有 LVGL 锁。全部画面开机时一次创建,运行中改文字、样式
+// 还会继续申请;池子耗尽时 LVGL 在 LV_ASSERT_MALLOC 处死循环,所以同时记下峰值,用来判断余量
+static void log_lvgl_pool(const char *when) {
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    ESP_LOGI(TAG, "LVGL 内存池(%s):已用 %u%%,空闲 %u B,最大空闲块 %u B,峰值已用 %u B", when,
+             (unsigned)mon.used_pct, (unsigned)mon.free_size, (unsigned)mon.free_biggest_size,
+             (unsigned)mon.max_used);
 }
 
 // 关闭外设并进入深睡,只能按键唤醒;唤醒等同重启,开机流程照常恢复显示与蓝牙。
@@ -250,6 +311,7 @@ static void app_task(void *arg) {
     bool had_frame = false;
     bool was_alive = false;        // 上一轮链路是否在线,用于识别连上与掉线
     bool was_confirming = false;   // 上一轮是否在配对确认,用于识别配对请求的出现
+    uint8_t last_menu_level = AR_MENU_CLOSED;   // 上一轮的菜单层级,关闭菜单时记录 LVGL 内存池
     ar_view_t view;
 
     for (;;) {
@@ -280,20 +342,33 @@ static void app_task(void *arg) {
         const ar_screen_t screen = ar_model_screen(&link.state, alive);
         s_screen = screen;
 
-        // 连上电脑与出现配对请求都点亮屏幕;掉线后,恢复时的第一帧完成数只作基准
-        if (alive && !was_alive) s_last_wake_us = now;
+        // 本地时间:用最近一帧状态的 tm 对时(到达时刻取两路中较晚的一个),之后本机走时。
+        // 帧里没有 tm 时保留上次对的时间;勿扰据此判断,生效时通知不亮屏、不响
+        const uint32_t now_ms = (uint32_t)(now / 1000);
+        if (link.has_state) {
+            const int64_t frame_us = link.last_usb_us > link.last_ble_us ? link.last_usb_us : link.last_ble_us;
+            ar_clock_sync(&s_clock, link.state.tm, (uint32_t)(frame_us / 1000));
+        }
+        const bool dnd = ar_dnd_active(s_dnd, s_night, &s_clock, now_ms);
+        const bool muted = s_volume == 0 || dnd;
+
+        // 连上电脑与出现配对请求都点亮屏幕(勿扰时连上电脑不亮屏);
+        // 掉线后,恢复时的第一帧完成数只作基准
+        if (alive && !was_alive && !dnd) wake(now);
         if (!alive && was_alive) ar_notice_offline(&s_notice);
         was_alive = alive;
-        if (ble.confirming && !was_confirming) s_last_wake_us = now;
+        if (ble.confirming && !was_confirming) wake(now);
         was_confirming = ble.confirming;
 
         // 每收到一帧新状态:识别通知,点亮屏幕,选择提示音,记录“完成 +N”
+        bool fresh_waiting = false;   // 本周期是否新增了等你处理,供再提醒重新计时
         if (link.has_state && (!had_frame || link.state.seq != last_seq)) {
             had_frame = true;
             last_seq = link.state.seq;
             const ar_notice_ev_t ev = ar_notice_update(&s_notice, link.state.wn, link.state.done);
-            if (ev.waiting || ev.completed > 0) s_last_wake_us = now;
-            const ar_chime_kind_t kind = ar_chime_pick(&s_chime, ev, (uint32_t)(now / 1000), s_volume == 0);
+            fresh_waiting = ev.waiting;
+            if ((ev.waiting || ev.completed > 0) && !dnd) wake(now);
+            const ar_chime_kind_t kind = ar_chime_pick(&s_chime, ev, now_ms, muted);
             ar_sound_play(kind, ar_volume_percent(s_volume));
             if (ev.completed > 0) {
                 s_done_flash_count = now < s_done_flash_until_us ? (uint16_t)(s_done_flash_count + ev.completed)
@@ -301,6 +376,16 @@ static void app_task(void *arg) {
                 s_done_flash_until_us = now + (int64_t)AR_DONE_FLASH_MS * 1000;
             }
         }
+        // 等你处理满 3 分钟没处理:再提醒一次,亮屏并按等你处理提示音的规则响一声。
+        // 链路不在线时按没有等待项处理,恢复后重新计时。勿扰期间照常计次,但不亮屏、不响
+        if (ar_remind_update(&s_remind, alive ? link.state.wn : 0, fresh_waiting, now_ms)) {
+            if (!dnd) wake(now);
+            const ar_notice_ev_t again = { .waiting = true, .completed = 0 };
+            const ar_chime_kind_t kind = ar_chime_pick(&s_chime, again, now_ms, muted);
+            ar_sound_play(kind, ar_volume_percent(s_volume));
+            ESP_LOGI(TAG, "等你处理未处理,第 %u 次再提醒%s", (unsigned)s_remind.count, dnd ? "(勿扰中,不亮屏不响)" : "");
+        }
+
         // 按工具识别新完成:A 帧只在变化时到达,逐轮比较即可;掉线后恢复的第一帧只作基准
         for (int i = 0; i < AR_AGENT_TOOLS; i++) {
             if (!alive) {
@@ -317,16 +402,19 @@ static void app_task(void *arg) {
         } else {
             s_disconnected_since_us = 0;
         }
-        // 拔掉 USB 时屏幕若亮着,补记一次亮屏事件:否则按电池规则(亮屏事件后 30 秒)
+        // 拔掉 USB 时屏幕若亮着,补记一次亮屏事件:否则按电池规则(亮屏事件后默认 30 秒)
         // 计时早已超时,亮着的屏幕会在拔线瞬间熄灭
         const bool on_usb = usb_serial_jtag_is_connected();
-        if (ar_power_update(&s_power, on_usb, s_backlight > 0)) s_last_wake_us = now;
+        if (ar_power_update(&s_power, on_usb, s_backlight > 0)) wake(now);
         const ar_backlight_in_t bl_in = {
             .screen = screen,
             .on_usb_power = on_usb,
             .level = s_brightness,
             .ms_since_wake = ms_since(s_last_wake_us, now),
             .ms_disconnected = s_disconnected_since_us ? ms_since(s_disconnected_since_us, now) : 0,
+            .battery_off = s_battery_off,
+            .usb_off = s_usb_off,
+            .locked = s_locked,
         };
         const uint8_t normal = ar_brightness_percent(s_brightness);
         uint8_t backlight = ble.confirming ? normal : ar_model_backlight_percent(&bl_in);
@@ -358,10 +446,17 @@ static void app_task(void *arg) {
         view.screen = screen;
         if (alive) {
             view.state = link.state;
+            view.state.tm = AR_TIME_UNKNOWN;   // 界面不显示时间,免得每分钟整屏重绘一次
             view.link_source = (uint8_t)link.last_source;
         }
         view.volume = s_volume;
         view.brightness = s_brightness;
+        view.battery_off = s_battery_off;
+        view.usb_off = s_usb_off;
+        view.dnd = s_dnd;
+        view.night = s_night;
+        view.night_state = (uint8_t)ar_night_state(&s_clock, now_ms);
+        view.dnd_active = dnd;
         view.menu_level = s_menu.level;
         view.menu_item = s_menu.item;
         view.done_flash = now < s_done_flash_until_us ? s_done_flash_count : 0;
@@ -386,6 +481,9 @@ static void app_task(void *arg) {
 
         if (bsp_lvgl_lock(LVGL_LOCK_TIMEOUT_MS)) {
             ar_ui_update(&view);
+            // 菜单刚关闭:各页刚刚用过,此时的峰值最能反映界面的内存余量
+            if (last_menu_level != AR_MENU_CLOSED && s_menu.level == AR_MENU_CLOSED) log_lvgl_pool("关闭菜单");
+            last_menu_level = s_menu.level;
             if (want_anim != anim_screen) {
                 anim_screen = want_anim;
                 tick = 0;
@@ -404,6 +502,10 @@ static void app_task(void *arg) {
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+            if (bsp_lvgl_lock(LVGL_LOCK_TIMEOUT_MS)) {
+                log_lvgl_pool("定期");
+                bsp_lvgl_unlock();
+            }
             next_heap_us = now + (int64_t)HEAP_LOG_PERIOD_MS * 1000;
         }
 
@@ -429,9 +531,13 @@ void app_main(void) {
 
     // 设置读取同时完成 NVS 初始化,蓝牙绑定存储也依赖 NVS
     ar_settings_load(&s_brightness, &s_volume);
+    ar_settings_load_screen_off(&s_battery_off, &s_usb_off);
+    ar_settings_load_dnd(&s_dnd, &s_night);
+    ar_clock_init(&s_clock);
     ar_notice_init(&s_notice);
     ar_menu_init(&s_menu);
     ar_chime_init(&s_chime);
+    ar_remind_init(&s_remind);
     ar_keywake_init(&s_keywake);
     ar_power_init(&s_power);
     for (int i = 0; i < AR_AGENT_TOOLS; i++) ar_notice_init(&s_agent_notice[i]);
@@ -453,6 +559,7 @@ void app_main(void) {
     if (bsp_lvgl_lock(1000)) {
         ar_ui_create();
         ar_capture_init();   // 在 BSP 圆角遮罩之后注册,截到的画面与屏幕一致
+        log_lvgl_pool("开机");
         bsp_lvgl_unlock();
     }
     s_last_key_us = esp_timer_get_time();
