@@ -12,7 +12,7 @@ void ar_settings_save_brightness(uint8_t level);
 // 音量档位见 ar_model.h 的 AR_VOLUME_LEVELS,0 为静音
 void ar_settings_save_volume(uint8_t level);
 
-// 读出电池供电、接电脑两项熄屏时间的选项序号(见 ar_model.h 的 ar_battery_off_ms()、
+// 读出电池供电、接电源两项熄屏时间的选项序号(见 ar_model.h 的 ar_battery_off_ms()、
 // ar_usb_off_ms());没有保存过或值越界时用默认选项。须在 ar_settings_load() 之后调用
 void ar_settings_load_screen_off(uint8_t *battery_option, uint8_t *usb_option);
 

@@ -18,7 +18,7 @@ typedef struct {
     uint8_t volume;        // 音量档位(0 为静音),标题栏喇叭图标与设置菜单
     uint8_t brightness;    // 亮度档位,设置菜单
     uint8_t battery_off;   // 电池熄屏时间选项,设置菜单
-    uint8_t usb_off;       // 接电脑熄屏时间选项,设置菜单
+    uint8_t usb_off;       // 接电源熄屏时间选项,设置菜单
     bool dnd;              // 勿扰(手动)开关,设置菜单
     bool night;            // 夜间勿扰开关,设置菜单
     uint8_t night_state;   // ar_night_t:夜间勿扰此刻的状态,夜间勿扰二级页面的说明

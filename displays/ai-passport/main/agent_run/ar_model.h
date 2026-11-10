@@ -2,8 +2,9 @@
 //
 // 把“收到的状态 + 时间”换算成要显示的画面、动画帧间隔、速度条格数、
 // 通知与提示音、再提醒、音量、亮度、熄屏时间、勿扰与本地时间、设置菜单与背光,
-// 以及工具专用页面的切换与文字。
-// 规则见设计方案 §7.2、§7.5、无线方案 §4.4、§7.4、专用页面方案 §4 与屏幕方案(-screen-dnd-design.md)。
+// 工具专用页面的切换与文字,以及按电池电压推断的外部供电。
+// 规则见设计方案 §7.2、§7.5、无线方案 §4.4、§7.4、专用页面方案 §4、屏幕方案(-screen-dnd-design.md)
+// 与供电方案(-power-detect-design.md)。
 #pragma once
 
 #include <stdbool.h>
@@ -19,12 +20,12 @@
 // 低亮度的背光百分比(设定亮度更低时用设定值)
 #define AR_DIM_PERCENT 20
 
-// 插着 USB 主机时:最近一次亮屏事件后最晚多久降到低亮度;熄屏时间短于它的两倍时,
+// 接着电源(USB 主机或充电器)时:最近一次亮屏事件后最晚多久降到低亮度;熄屏时间短于它的两倍时,
 // 改在熄屏时间的一半调暗。熄屏时间由用户设定,见 ar_usb_off_ms()
 #define AR_USB_DIM_AFTER_MS 300000u
 
 // 熄屏时间的设定选项(存的是选项序号)。电池供电时亮屏期间一直用低亮度。
-// 电池供电:10 秒、30 秒、1 分、3 分;接电脑:5 分、10 分、30 分、1 小时、不熄屏。
+// 电池供电:10 秒、30 秒、1 分、3 分;接电源:5 分、10 分、30 分、1 小时、不熄屏。
 // 默认值与改版前的固定时限相同(30 秒、30 分钟)
 #define AR_BATTERY_OFF_OPTIONS 4
 #define AR_BATTERY_OFF_DEFAULT 1
@@ -55,7 +56,7 @@
 #define AR_MENU_LIST_TIMEOUT_MS 10000u
 #define AR_MENU_ADJUST_TIMEOUT_MS 3000u
 
-// “未连接”且无亮屏事件持续这么久后关背光(插着 USB 主机时也生效)
+// “未连接”且无亮屏事件持续这么久后关背光(接着电源时也生效)
 #define AR_BACKLIGHT_IDLE_MS 300000u
 
 // 电池供电时,“未连接”且无按键持续这么久就进入深睡(晚于关背光)
@@ -202,7 +203,7 @@ uint8_t ar_brightness_percent(uint8_t level);
 // 加减亮度:到最低档与最高档时停住;越界先按最高档处理
 uint8_t ar_brightness_step(uint8_t level, int delta);
 
-// 熄屏时间选项 → 毫秒;越界按最后一项。接电脑的最后一项“不熄屏”返回 AR_OFF_NEVER
+// 熄屏时间选项 → 毫秒;越界按最后一项。接电源的最后一项“不熄屏”返回 AR_OFF_NEVER
 uint32_t ar_battery_off_ms(uint8_t option);
 uint32_t ar_usb_off_ms(uint8_t option);
 
@@ -257,7 +258,7 @@ typedef enum {
     AR_MENU_VOLUME = 0,
     AR_MENU_BRIGHTNESS,
     AR_MENU_BATTERY_OFF,   // 电池熄屏时间
-    AR_MENU_USB_OFF,       // 接电脑熄屏时间
+    AR_MENU_USB_OFF,       // 接电源熄屏时间
     AR_MENU_DND,           // 勿扰(手动开关)
     AR_MENU_NIGHT,         // 夜间勿扰
     AR_MENU_ITEMS,
@@ -291,12 +292,12 @@ void ar_menu_tick(ar_menu_t *m, uint32_t ms_since_key);
 // 背光计算的输入
 typedef struct {
     ar_screen_t screen;
-    bool on_usb_power;          // 接着 USB 主机
+    bool on_power;              // 接着电源:USB 主机在线,或按电池电压推断接着充电器,见 ar_extpower_update()
     uint8_t level;              // 用户设定的亮度档位
     uint32_t ms_since_wake;     // 距最近一次亮屏事件(按键、通知、连上电脑、配对确认、开机),从未发生传 UINT32_MAX
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
     uint8_t battery_off;        // 电池供电的熄屏时间选项,见 ar_battery_off_ms()
-    uint8_t usb_off;            // 接电脑的熄屏时间选项,见 ar_usb_off_ms()
+    uint8_t usb_off;            // 接电源的熄屏时间选项,见 ar_usb_off_ms()
     bool locked;                // 用户手动熄屏,到下一次亮屏事件为止
 } ar_backlight_in_t;
 
@@ -326,31 +327,79 @@ void ar_keywake_release(ar_keywake_t *k, uint32_t now_ms);
 // false 表示它属于亮屏那次手势,应当忽略
 bool ar_keywake_action(ar_keywake_t *k);
 
-// 供电方式跟踪。插着 USB 主机与电池供电的熄屏时限不同(默认 30 分钟与 30 秒),
-// 拔线瞬间若仍按最近一次亮屏事件计时,亮着的屏幕会立刻熄灭
+// 外部供电推断。板上没有 VBUS 或充电状态检测引脚,芯片只知道 USB 主机是否在线,
+// 接充电器、充电宝或主机睡眠时都看不出接着电源。这里靠电量计的电池电压推断:
+// 本板的电源路径在接着电源时由充电器带负载,电池只承担充电电流,所以插拔都会让电压在一个采样点内跳变。
+// 2026-11-10 真机实测(电量 97%,每 500 ms 一点):插上 +75..+94 mV;充满停充 -42..-49 mV(仍接着电源);
+// 停充后拔掉 -16..-20 mV(只剩负载转回电池);其余时间相邻点相差不超过 3 mV。详见供电方案 §3
+#define AR_PWR_SAMPLE_MS 500u      // 采样周期,调用方按这个节拍调用 ar_extpower_update()
+#define AR_PWR_STEP_MV 10          // 插拔判定的最小跳变,连续两点成立才算
+#define AR_PWR_CV_MV 4195          // 充电器恒压段的电压下限:实测恒压段 4203..4221,电池单独供电不超过 4150
+#define AR_PWR_TERM_MAX_MV 55      // 恒压段停充的最大降幅:实测 42..49;达到它视为恒压段拔掉(还要加上负载那一份)
+#define AR_PWR_SOC_FALL 2          // 判定接着电源、USB 主机离线,电量却比最高值低了这么多:其实在耗电池
+#define AR_PWR_HISTORY 14          // 保留的采样点数:最近两点 + 之前 6 秒作基准
+
+// 推断出的供电状态
+typedef enum {
+    AR_PWR_BATTERY = 0,    // 电池供电
+    AR_PWR_CHARGING,       // 接着电源,正在充电(插上的跳变,或电压到了恒压段)
+    AR_PWR_IDLE,           // 接着电源,没在充电(充满停充,或 USB 主机在线时)
+} ar_pwr_state_t;
+
+// 设备自身负载在本采样周期内的变化。改背光会让电池电压跳几毫伏到十几毫伏,提示音会让它短暂下陷,
+// 都要和插拔区分开
+typedef enum {
+    AR_LOAD_STEADY = 0,    // 负载没变
+    AR_LOAD_CHANGED,       // 负载变了(背光变化):丢掉旧基准,以新电平重新开始
+    AR_LOAD_TRANSIENT,     // 短暂负载(提示音):这一点不计入
+} ar_load_t;
+
 typedef struct {
-    bool known;    // 是否已记录过供电方式
-    bool on_usb;   // 上一次的供电方式
+    int16_t mv[AR_PWR_HISTORY];   // 最近的电压采样,mv[n-1] 最新
+    uint8_t n;                    // 有效采样点数
+    uint8_t state;                // ar_pwr_state_t
+    int8_t peak_soc;              // 判定接着电源以来的最高电量,-1 表示还没有读数
+} ar_extpower_t;
+
+void ar_extpower_init(ar_extpower_t *p);
+
+// 每 AR_PWR_SAMPLE_MS 调用一次,返回是否接着外部电源。mv、soc 为电量计读数,读失败传负数;
+// usb_host 为 USB 主机在线。规则(最近两点都要满足,避免单点毛刺):
+// - USB 主机在线:一定接着电源;离线时不改判定,电压没有降(Mac 睡眠、USB 挂起)就仍算接着电源;
+// - 两点都比之前 6 秒的最高值高出 AR_PWR_STEP_MV:插上,进入充电;
+// - 两点都达到 AR_PWR_CV_MV:电池单独供电达不到这个电压,进入充电(开机时已在恒压充电);
+// - 接着电源时,两点都比之前 2 秒的中位数低 AR_PWR_STEP_MV:从恒压段降、且降幅小于
+//   AR_PWR_TERM_MAX_MV 是充满停充,仍接着电源;否则是拔掉(USB 主机在线时除外)。电池供电时的
+//   下陷是负载引起的,不改判定、不重置基准,回升时才不会被当成插上;
+// - 兜底:判定接着电源、USB 主机离线,电量比判定以来的最高值低 AR_PWR_SOC_FALL,改判电池供电。
+// 判定改变后只留最近两点作新基准,同一次跳变不会重复触发
+bool ar_extpower_update(ar_extpower_t *p, int mv, int soc, bool usb_host, ar_load_t load);
+
+// 供电方式跟踪,用来在插拔时补记亮屏事件
+typedef struct {
+    bool known;      // 是否已记录过供电方式
+    bool on_power;   // 上一次是否接着电源
 } ar_power_t;
 
 void ar_power_init(ar_power_t *p);
 
-// 每个周期调用一次。返回 true 表示调用方应记一次亮屏事件:从 USB 主机供电变为电池供电,
-// 且此刻屏幕亮着。屏幕已熄灭时(包括 Mac 睡眠导致 USB 主机离线)不点亮;插上 USB 不在这里点亮,
-// 连上电脑另有亮屏事件。第一次调用只记录基准
-bool ar_power_update(ar_power_t *p, bool on_usb, bool screen_on);
+// 每个周期调用一次。返回 true 表示调用方应记一次亮屏事件:
+// - 接上电源(USB 主机或充电器):不论屏幕亮灭、是否手动熄屏、是否勿扰都点亮,插电是用户自己的操作;
+// - 断开电源且此刻屏幕亮着:电池熄屏时限短得多(默认 30 秒),按最近一次亮屏事件计时会让屏幕立刻熄灭。
+// 第一次调用只记录基准:开机本身就算亮屏事件
+bool ar_power_update(ar_power_t *p, bool on_power, bool screen_on);
 
 // 背光百分比,0 表示熄屏。“低亮度”为 AR_DIM_PERCENT 与设定亮度中较低者。
 // - 手动熄屏后:到下一次亮屏事件前一直熄灭;
 // - 电池供电:亮屏事件后在电池熄屏时间内用低亮度,之后熄屏;
-// - 插着 USB 主机且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏(不受熄屏设置影响);
-// - 插着 USB 主机:亮屏事件后先用设定亮度,满 AR_USB_DIM_AFTER_MS 与熄屏时间一半中较短者
-//   降到低亮度,满接电脑熄屏时间熄屏;“不熄屏”时一直保持低亮度。
+// - 接着电源且“未连接”:未连接与无亮屏事件都满 AR_BACKLIGHT_IDLE_MS 时熄屏(不受熄屏设置影响);
+// - 接着电源:亮屏事件后先用设定亮度,满 AR_USB_DIM_AFTER_MS 与熄屏时间一半中较短者
+//   降到低亮度,满接电源熄屏时间熄屏;“不熄屏”时一直保持低亮度。
 uint8_t ar_model_backlight_percent(const ar_backlight_in_t *in);
 
 // 深睡判定的输入
 typedef struct {
-    bool on_usb_power;          // 接着 USB 主机(只认主机在线,充电宝或主机睡眠时为 false)
+    bool on_power;              // 接着电源(USB 主机在线,或推断接着充电器),见 ar_extpower_update()
     bool battery_present;       // 电量计读得到电量;读不到时可能没装电池,只靠 USB 供电
     bool confirming;            // 正在等用户确认配对
     uint32_t ms_disconnected;   // 已处于“未连接”的时长,在线时为 0
@@ -358,7 +407,7 @@ typedef struct {
     uint32_t ms_dark;           // 屏幕已持续熄灭的时长,亮着时为 0
 } ar_sleep_in_t;
 
-// 是否该进入深睡(关机,按任意键唤醒)。前提是没接 USB 主机、电量计正常、不在配对确认,
+// 是否该进入深睡(关机,按任意键唤醒)。前提是没接电源、电量计正常、不在配对确认,
 // 满足其一即睡:
 // - “未连接”与无按键都已满 AR_DEEP_SLEEP_AFTER_MS;
 // - 屏幕持续熄灭已满 AR_POWER_OFF_AFTER_DARK_MS。在线时也适用:等你处理、有会话完成

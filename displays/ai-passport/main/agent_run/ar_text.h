@@ -50,7 +50,7 @@
 
 // 设置菜单:熄屏时间与勿扰(屏幕方案 §4、§6、§7)
 #define AR_TXT_MENU_BATTERY_OFF "电池熄屏"
-#define AR_TXT_MENU_USB_OFF "接电脑熄屏"
+#define AR_TXT_MENU_USB_OFF "接电源熄屏"
 #define AR_TXT_MENU_DND "勿扰"
 #define AR_TXT_MENU_NIGHT "夜间勿扰"
 #define AR_TXT_MENU_TOGGLE_HINT "上下切换 · 双击返回"
