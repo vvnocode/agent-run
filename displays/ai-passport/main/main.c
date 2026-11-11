@@ -423,6 +423,7 @@ static void app_task(void *arg) {
         // 供电:USB 主机在线时一定接着电源;此外每 AR_PWR_SAMPLE_MS 读一次电池电压,推断是否接着
         // 充电器。背光改变后的几个点按负载变化处理,提示音刚响过的点不计入,免得设备自己的负载被当成插拔
         const bool usb_host = usb_serial_jtag_is_connected();
+        bool plug_step = false;   // 本周期认出了插上的跳变
         if (now >= next_power_us) {
             if (s_backlight != power_bl) {
                 power_bl = s_backlight;
@@ -437,17 +438,22 @@ static void app_task(void *arg) {
             }
             const int mv = bsp_battery_mv();
             const bool on_extpower = ar_extpower_update(&s_extpower, mv, bsp_battery_soc(), usb_host, load);
+            plug_step = s_extpower.plugged;
             if (on_extpower != s_on_extpower) {
                 ESP_LOGI(TAG, "%s:电池 %d mV,USB 主机%s,判定状态 %u", on_extpower ? "接上电源" : "断开电源", mv,
                          usb_host ? "在线" : "离线", (unsigned)s_extpower.state);
                 s_on_extpower = on_extpower;
+            } else if (plug_step) {
+                // 判定原本就是接着电源:之前的拔掉没认出来,这次插上只能靠跳变亮屏
+                ESP_LOGI(TAG, "插上电源(之前判定已是接着电源):电池 %d mV,USB 主机%s", mv, usb_host ? "在线" : "离线");
             }
             next_power_us = now + (int64_t)AR_PWR_SAMPLE_MS * 1000;
         }
         const bool on_power = usb_host || s_on_extpower;
         // 接上电源一律点亮屏幕(熄屏、手动熄屏、勿扰时都亮);断开时屏幕若亮着补记一次亮屏事件,
-        // 否则按电池规则(亮屏事件后默认 30 秒)计时早已超时,亮着的屏幕会在断电瞬间熄灭
-        if (ar_power_update(&s_power, on_power, s_backlight > 0)) wake(now);
+        // 否则按电池规则(亮屏事件后默认 30 秒)计时早已超时,亮着的屏幕会在断电瞬间熄灭。
+        // 认出插上的跳变也亮屏:漏判过拔掉时判定一直是接着电源,只看判定变化会漏掉这次插上
+        if (ar_power_update(&s_power, on_power, s_backlight > 0) || plug_step) wake(now);
         const ar_backlight_in_t bl_in = {
             .screen = screen,
             .on_power = on_power,

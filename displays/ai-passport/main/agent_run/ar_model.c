@@ -352,7 +352,9 @@ static void extpower_set(ar_extpower_t *p, ar_pwr_state_t state, int soc) {
     extpower_rebase(p);
 }
 
-// 按最近两点与之前的基准判断插拔。至少要有 6 点:最近两点 + 4 点基准
+// 按最近两点与之前的基准判断插拔。至少要有 3 点:最近两点 + 1 点基准。基准重置(背光变化、判定改变)后
+// 若要攒满几点才开始判断,这期间的跳变会混进基准,之后再也比不出来;实测相邻点相差不超过 3 mV,
+// 1 点基准配合两点确认足以区分 AR_PWR_STEP_MV 的跳变
 static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
     const int n = p->n;
     const int a = p->mv[n - 1];
@@ -363,24 +365,29 @@ static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
     // 电池单独供电达不到恒压段的电压:开机时已在恒压充电,或插上的跳变被负载变化盖过时,靠它补上
     if (p->state == AR_PWR_BATTERY && lo >= AR_PWR_CV_MV) {
         extpower_set(p, AR_PWR_CHARGING, soc);
+        p->plugged = true;
         return;
     }
-    if (n < 6) return;
+    if (n < 3) return;
 
-    // 插上的基准取之前 6 秒的最高值:负载下陷后回升只回到原电平,不会超过下陷前的最高值
+    // 插上的基准取之前 6 秒的最高值:负载下陷后回升只回到原电平,不会超过下陷前的最高值。
+    // 已判定接着电源时也照样认:判定可能因漏判拔掉而过时,插上的跳变才是用户真的插了电。
+    // 每次都重置基准,同一次跳变只报一次
     int base_max = p->mv[0];
     for (int i = 1; i < n - 2; i++) {
         if (p->mv[i] > base_max) base_max = p->mv[i];
     }
     if (lo >= base_max + AR_PWR_STEP_MV) {
-        if (p->state != AR_PWR_CHARGING) extpower_set(p, AR_PWR_CHARGING, soc);
+        extpower_set(p, AR_PWR_CHARGING, soc);
+        p->plugged = true;
         return;
     }
 
-    // 拔掉的基准取之前 2 秒(4 点)的中位数,不受单点毛刺影响
+    // 拔掉的基准取最近两点之前至多 2 秒(4 点)的中位数,不受单点毛刺影响;基准刚重置时有几点用几点
+    const int k = n - 2 < 4 ? n - 2 : 4;
     int s[4];
-    for (int i = 0; i < 4; i++) s[i] = p->mv[n - 6 + i];
-    for (int i = 1; i < 4; i++) {   // 4 个数的插入排序
+    for (int i = 0; i < k; i++) s[i] = p->mv[n - 2 - k + i];
+    for (int i = 1; i < k; i++) {   // 至多 4 个数的插入排序
         const int v = s[i];
         int j = i - 1;
         while (j >= 0 && s[j] > v) {
@@ -389,7 +396,7 @@ static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
         }
         s[j + 1] = v;
     }
-    const int base_med = (s[1] + s[2]) / 2;
+    const int base_med = k % 2 ? s[k / 2] : (s[k / 2 - 1] + s[k / 2]) / 2;
     if (hi + AR_PWR_STEP_MV > base_med) return;
     // 电池供电时的下陷是负载引起的:不改判定,也不重置基准
     if (p->state == AR_PWR_BATTERY) return;
@@ -406,8 +413,11 @@ static void extpower_detect(ar_extpower_t *p, int soc, bool usb_host) {
 }
 
 bool ar_extpower_update(ar_extpower_t *p, int mv, int soc, bool usb_host, ar_load_t load) {
+    p->plugged = false;   // 只报本次采样认出的跳变
     if (mv > 0 && load != AR_LOAD_TRANSIENT) {
-        if (load == AR_LOAD_CHANGED) p->n = 0;   // 自身负载变了:旧基准不可比
+        // 自身负载变了:电池供电时旧基准不可比,重新开始。接着电源时负载由充电器带,电池电压不受影响
+        // (实测停充后背光 0 ↔ 100% 电压不变),保留基准,插上亮屏后马上拔掉也认得出
+        if (load == AR_LOAD_CHANGED && p->state == AR_PWR_BATTERY) p->n = 0;
         if (p->n == AR_PWR_HISTORY) {
             memmove(p->mv, p->mv + 1, sizeof(p->mv[0]) * (AR_PWR_HISTORY - 1));
             p->n--;
